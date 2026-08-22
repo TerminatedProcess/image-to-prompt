@@ -1,6 +1,8 @@
 import requests
 import json
+import re
 import base64
+import os
 from pathlib import Path
 import subprocess
 import mimetypes
@@ -14,6 +16,17 @@ except ImportError:
     MINICPM_AVAILABLE = False
     MiniCPMClient = None
 
+# Vision-capable LLM families we can actually caption with. Everything else the
+# backend advertises (Krea/SDXL/Illustrious/Flux/Wan/Z-Image diffusion checkpoints,
+# text-only LLMs) has no usable image->text path and 404s or 400s on
+# /v1/chat/completions, so we keep them out of the model picker.
+_VISION_MODEL_RE = re.compile(
+    r"(qwen[\w.\-]*vl|minicpm-?v|llava|internvl|intern-vl|pixtral|glm-?4v|"
+    r"moondream|smolvlm|phi[\w.\-]*vision|cogvlm|idefics|molmo)",
+    re.IGNORECASE,
+)
+
+
 class APIClient:
     """A client for interacting with local LLM APIs (Ollama, LM Studio, and Koboldcpp)."""
     
@@ -24,6 +37,9 @@ class APIClient:
         self.ollama_keep_alive = ollama_keep_alive
         self.unload_after_response = unload_after_response
         self.minicpm_client = None
+        # Bearer token for OpenAI-compatible backends (e.g. Unsloth Studio) that require auth.
+        # Read from env so the four APIClient() call sites and the UI don't need changes.
+        self.api_key = os.environ.get("LMSTUDIO_API_KEY")
         
         if self.provider == "MiniCPM":
             if not MINICPM_AVAILABLE:
@@ -59,7 +75,8 @@ class APIClient:
         elif self.provider == "Google":
             return ["gemini-1.5-flash-latest", "gemini-2.0-flash", "gemini-2.5-flash"]
         try:
-            response = requests.get(self.models_endpoint, timeout=10)
+            headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+            response = requests.get(self.models_endpoint, headers=headers, timeout=10)
             response.raise_for_status()
             data = response.json()
             # Only show models if the backend matches the provider
@@ -67,7 +84,11 @@ class APIClient:
                 # If any model is owned by koboldcpp, treat as koboldcpp backend and return []
                 if data.get('object') == 'list' and any('owned_by' in m and m['owned_by'] == 'koboldcpp' for m in data.get('data', [])):
                     return []
-                return [model['id'] for model in data.get('data', []) if model.get('owned_by', '').lower() != 'koboldcpp']
+                # Only surface vision-capable models — the backend also lists dozens of
+                # diffusion checkpoints that can't caption (see _VISION_MODEL_RE).
+                return [model['id'] for model in data.get('data', [])
+                        if model.get('owned_by', '').lower() != 'koboldcpp'
+                        and _VISION_MODEL_RE.search(model['id'])]
             elif self.provider == "Koboldcpp":
                 return [model['id'] for model in data.get('data', []) if model.get('owned_by', '').lower() == 'koboldcpp' or 'owned_by' not in model]
             elif self.provider == "Ollama":
@@ -170,6 +191,8 @@ class APIClient:
     def generate_chat_response(self, model, messages, images=None, videos=None, stream=True):
         """Sends a request to the chat API and yields the response chunks."""
         headers = {"Content-Type": "application/json"}
+        if self.api_key and self.provider in ("LM Studio", "Koboldcpp"):
+            headers["Authorization"] = f"Bearer {self.api_key}"
         
         if self.provider == "MiniCPM":
             if not self.minicpm_client:

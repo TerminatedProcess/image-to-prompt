@@ -69,7 +69,7 @@ def load_config():
     ensure_data_dirs()
 
     default_config = {
-        "api_provider": "Ollama",
+        "api_provider": "LM Studio",
         "google_api_key": None,
         "providers": {
             "Ollama": {
@@ -80,8 +80,8 @@ def load_config():
                 "api_base_url": "https://generativelanguage.googleapis.com",
                 "selected_models": []
             },
-            "LM Studio": { # Add LM Studio defaults
-                "api_base_url": "http://localhost:1234",
+            "LM Studio": { # Add LM Studio defaults (wired to local Unsloth Studio vision server)
+                "api_base_url": "http://localhost:8889",
                 "selected_models": [],
                 "unload_after_response": False
             },
