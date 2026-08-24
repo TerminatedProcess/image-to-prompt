@@ -89,6 +89,12 @@ def load_config():
                 "api_base_url": "http://localhost:5001",
                 "selected_models": []
             },
+            "Unsloth": { # Unsloth Studio's OpenAI-compatible server (auth-gated, needs api_key)
+                "api_base_url": "http://localhost:8889",
+                "selected_models": [],
+                "api_key": "",
+                "unload_after_response": False
+            },
             "MiniCPM": { # Add MiniCPM defaults
                 "selected_model": "MiniCPM-V-4.5-int4",
                 "device": "auto",

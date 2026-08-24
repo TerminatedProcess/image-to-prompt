@@ -305,10 +305,11 @@ def run_generation_logic():
             base_url=provider_config.get("api_base_url") if current_provider_name not in ["Google", "MiniCPM"] else None,
             google_api_key=st.session_state.config.get("google_api_key") if current_provider_name == "Google" else None,
             ollama_keep_alive=provider_config.get("keep_alive") if current_provider_name == "Ollama" else None,
-            unload_after_response=provider_config.get("unload_after_response", False) if current_provider_name == "LM Studio" else provider_config.get("auto_unload", False) if current_provider_name == "MiniCPM" else False,
-            minicpm_config=minicpm_config
+            unload_after_response=provider_config.get("unload_after_response", False) if current_provider_name in ("LM Studio", "Unsloth") else provider_config.get("auto_unload", False) if current_provider_name == "MiniCPM" else False,
+            minicpm_config=minicpm_config,
+            api_key=provider_config.get("api_key") if current_provider_name == "Unsloth" else None
         )
-        
+
         for model in st.session_state.config["providers"][st.session_state.config["api_provider"]]["selected_models"]:
             with st.chat_message("assistant"):
                 message_placeholder = st.empty()
@@ -420,11 +421,12 @@ def regenerate_message(idx, container=None):
             minicpm_config = st.session_state.config['providers'][st.session_state.config['api_provider']]
         
         api_client = APIClient(
-            provider=st.session_state.config['api_provider'], 
-            base_url=st.session_state.config['providers'][st.session_state.config['api_provider']]['api_base_url'] if st.session_state.config['api_provider'] not in ['Google', 'MiniCPM'] else None, 
+            provider=st.session_state.config['api_provider'],
+            base_url=st.session_state.config['providers'][st.session_state.config['api_provider']]['api_base_url'] if st.session_state.config['api_provider'] not in ['Google', 'MiniCPM'] else None,
             google_api_key=st.session_state.config.get('google_api_key') if st.session_state.config['api_provider'] == 'Google' else None,
-            unload_after_response=st.session_state.config['providers'][st.session_state.config['api_provider']].get("unload_after_response", False) if st.session_state.config['api_provider'] in ['LM Studio', 'MiniCPM'] else False,
-            minicpm_config=minicpm_config
+            unload_after_response=st.session_state.config['providers'][st.session_state.config['api_provider']].get("unload_after_response", False) if st.session_state.config['api_provider'] in ['LM Studio', 'MiniCPM', 'Unsloth'] else False,
+            minicpm_config=minicpm_config,
+            api_key=st.session_state.config['providers'][st.session_state.config['api_provider']].get('api_key') if st.session_state.config['api_provider'] == 'Unsloth' else None
         )
         target = container if container is not None else st
         message_placeholder = target.empty()
@@ -479,7 +481,7 @@ with st.sidebar:
                 cm.delete_conversation(st.session_state.chat_id); start_new_chat(); st.toast("Chat deleted!", icon="🗑️"); st.rerun()
     st.divider()
     st.header("⚙️ Configuration")
-    api_providers = ["Ollama", "LM Studio", "Koboldcpp", "Google", "MiniCPM"]
+    api_providers = ["Ollama", "LM Studio", "Koboldcpp", "Unsloth", "Google", "MiniCPM"]
     current_provider = st.session_state.config.get("api_provider", "Ollama")
     st.session_state.config["api_provider"] = st.radio(
         "API Provider",
@@ -577,10 +579,12 @@ with st.sidebar:
         default_urls = {
             "Ollama": "http://localhost:11434",
             "LM Studio": "http://localhost:1234",
-            "Koboldcpp": "http://localhost:5001"
+            "Koboldcpp": "http://localhost:5001",
+            "Unsloth": "http://localhost:8889"
         }
-        # Use the saved URL for the current provider, or its default if not set
-        current_api_base_url = provider_config.get("api_base_url", default_urls.get(current_provider_name, ""))
+        # Use the saved URL for the current provider, or its default if not set.
+        # `or` (not .get default) so an empty saved string also falls back to the default.
+        current_api_base_url = provider_config.get("api_base_url") or default_urls.get(current_provider_name, "")
         provider_config["api_base_url"] = st.text_input(
             "API Base URL",
             value=current_api_base_url,
@@ -588,7 +592,17 @@ with st.sidebar:
             disabled=st.session_state.generating,
             on_change=lambda: cm.save_config(st.session_state.config)
         )
-        if current_provider_name == "LM Studio":
+        if current_provider_name == "Unsloth":
+            provider_config["api_key"] = st.text_input(
+                "API Key",
+                value=provider_config.get("api_key", ""),
+                type="password",
+                help="Unsloth Studio API key — mint one in Studio under Settings > API. Sent as the OpenAI Bearer token.",
+                key=f"api_key_input_{current_provider_name}",
+                disabled=st.session_state.generating,
+                on_change=lambda: cm.save_config(st.session_state.config)
+            )
+        if current_provider_name in ("LM Studio", "Unsloth"):
             provider_config["unload_after_response"] = st.checkbox(
                 "Unload model after response",
                 value=provider_config.get("unload_after_response", False),
@@ -617,8 +631,9 @@ with st.sidebar:
         base_url=provider_config.get("api_base_url") if current_provider_name not in ["Google", "MiniCPM"] else None,
         google_api_key=st.session_state.config.get("google_api_key") if current_provider_name == "Google" else None,
         ollama_keep_alive=provider_config.get("keep_alive") if current_provider_name == "Ollama" else None, # Pass keep_alive
-        unload_after_response=provider_config.get("unload_after_response", False) if current_provider_name == "LM Studio" else provider_config.get("auto_unload", False) if current_provider_name == "MiniCPM" else False,
-        minicpm_config=minicpm_config
+        unload_after_response=provider_config.get("unload_after_response", False) if current_provider_name in ("LM Studio", "Unsloth") else provider_config.get("auto_unload", False) if current_provider_name == "MiniCPM" else False,
+        minicpm_config=minicpm_config,
+        api_key=provider_config.get("api_key") if current_provider_name == "Unsloth" else None
     )
 
     with st.spinner("Fetching available models..."):

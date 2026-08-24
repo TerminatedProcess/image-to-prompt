@@ -5,3 +5,4 @@ __pycache__
 temp_images
 data/conversations
 temp_videos
+.claude/

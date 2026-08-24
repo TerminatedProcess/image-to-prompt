@@ -30,7 +30,7 @@ _VISION_MODEL_RE = re.compile(
 class APIClient:
     """A client for interacting with local LLM APIs (Ollama, LM Studio, and Koboldcpp)."""
     
-    def __init__(self, provider="Ollama", base_url="http://localhost:11434", google_api_key=None, ollama_keep_alive=None, unload_after_response=False, minicpm_config=None):
+    def __init__(self, provider="Ollama", base_url="http://localhost:11434", google_api_key=None, ollama_keep_alive=None, unload_after_response=False, minicpm_config=None, api_key=None):
         self.provider = provider
         self.base_url = base_url.rstrip('/') if base_url else None
         self.google_api_key = google_api_key
@@ -38,8 +38,9 @@ class APIClient:
         self.unload_after_response = unload_after_response
         self.minicpm_client = None
         # Bearer token for OpenAI-compatible backends (e.g. Unsloth Studio) that require auth.
-        # Read from env so the four APIClient() call sites and the UI don't need changes.
-        self.api_key = os.environ.get("LMSTUDIO_API_KEY")
+        # Prefer an explicitly-passed key (Unsloth's Settings > API key, entered in the UI),
+        # else fall back to the LMSTUDIO_API_KEY env var.
+        self.api_key = api_key or os.environ.get("LMSTUDIO_API_KEY")
         
         if self.provider == "MiniCPM":
             if not MINICPM_AVAILABLE:
@@ -55,7 +56,7 @@ class APIClient:
                     max_num_packing=minicpm_config.get("max_num_packing", 3),
                     fps=minicpm_config.get("default_fps", 3)
                 )
-        elif self.provider in ("LM Studio", "Koboldcpp"):
+        elif self.provider in ("LM Studio", "Koboldcpp", "Unsloth"):
             self.api_endpoint = f"{self.base_url}/v1/chat/completions"
             self.models_endpoint = f"{self.base_url}/v1/models"
         elif self.provider == "Google":
@@ -89,6 +90,11 @@ class APIClient:
                 return [model['id'] for model in data.get('data', [])
                         if model.get('owned_by', '').lower() != 'koboldcpp'
                         and _VISION_MODEL_RE.search(model['id'])]
+            elif self.provider == "Unsloth":
+                # Unsloth Studio's OpenAI-compatible /v1/models. Surface only vision-capable
+                # models (it also lists text-only + diffusion entries that can't caption).
+                return [model['id'] for model in data.get('data', [])
+                        if _VISION_MODEL_RE.search(model['id'])]
             elif self.provider == "Koboldcpp":
                 return [model['id'] for model in data.get('data', []) if model.get('owned_by', '').lower() == 'koboldcpp' or 'owned_by' not in model]
             elif self.provider == "Ollama":
@@ -191,7 +197,7 @@ class APIClient:
     def generate_chat_response(self, model, messages, images=None, videos=None, stream=True):
         """Sends a request to the chat API and yields the response chunks."""
         headers = {"Content-Type": "application/json"}
-        if self.api_key and self.provider in ("LM Studio", "Koboldcpp"):
+        if self.api_key and self.provider in ("LM Studio", "Koboldcpp", "Unsloth"):
             headers["Authorization"] = f"Bearer {self.api_key}"
         
         if self.provider == "MiniCPM":
@@ -461,7 +467,7 @@ class APIClient:
 
         if images and messages and messages[-1]['role'] == 'user':
             last_message = messages[-1]
-            if self.provider in ("LM Studio", "Koboldcpp"):
+            if self.provider in ("LM Studio", "Koboldcpp", "Unsloth"):
                 content_parts = [{"type": "text", "text": last_message['content']}]
                 for img_path in images:
                     b64_img = self._encode_image(img_path)
@@ -525,7 +531,7 @@ class APIClient:
                                     continue
                                 try:
                                     chunk = json.loads(json_str)
-                                    if self.provider == "LM Studio":
+                                    if self.provider in ("LM Studio", "Unsloth"):
                                         if 'choices' in chunk and chunk['choices']:
                                             content = chunk['choices'][0]['delta'].get('content', '')
                                         else:
@@ -550,7 +556,7 @@ class APIClient:
                 f"**Full raw response from server:**\n\n```\n{raw_response_for_debugging or 'Response was empty.'}\n```"
             )
         finally:
-            if self.provider in ["LM Studio", "MiniCPM"] and self.unload_after_response:
+            if self.provider in ["LM Studio", "MiniCPM", "Unsloth"] and self.unload_after_response:
                 self.unload_model(model)
 
     def unload_model(self, model_name):
@@ -578,6 +584,23 @@ class APIClient:
             except subprocess.CalledProcessError as e:
                 print(f"LM Studio unload failed. Stderr: {e.stderr}")
                 return {"status": "error", "message": f"Failed to unload models via CLI. Error: {e.stderr}"}
+        elif self.provider == "Unsloth":
+            # Unsloth Studio exposes POST /v1/unload (auth-gated). Best-effort: a
+            # mismatch or failure is non-fatal, Studio also unloads on idle.
+            try:
+                headers = {"Content-Type": "application/json"}
+                if self.api_key:
+                    headers["Authorization"] = f"Bearer {self.api_key}"
+                resp = requests.post(
+                    f"{self.base_url}/v1/unload",
+                    headers=headers,
+                    json={"model_path": model_name},
+                    timeout=180,
+                )
+                resp.raise_for_status()
+                return {"status": "success", "message": f"Unloaded Unsloth model '{model_name}'."}
+            except requests.exceptions.RequestException as e:
+                return {"status": "error", "message": f"Failed to unload Unsloth model: {e}"}
         elif self.provider == "Ollama":
             # Ollama handles unloading automatically. Simulate success.
             return {"status": "success", "message": f"'{model_name}' (Ollama) is managed automatically."}

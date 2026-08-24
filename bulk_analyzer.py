@@ -50,8 +50,9 @@ def bulk_analysis_page():
                     base_url=provider_config.get("api_base_url") if current_provider_name not in ["Google", "MiniCPM"] else None,
                     google_api_key=st.session_state.config.get("google_api_key") if current_provider_name == "Google" else None,
                     ollama_keep_alive=provider_config.get("keep_alive") if current_provider_name == "Ollama" else None,
-                    unload_after_response=provider_config.get("unload_after_response", False) if current_provider_name == "LM Studio" else provider_config.get("auto_unload", False) if current_provider_name == "MiniCPM" else False,
-                    minicpm_config=minicpm_config
+                    unload_after_response=provider_config.get("unload_after_response", False) if current_provider_name in ("LM Studio", "Unsloth") else provider_config.get("auto_unload", False) if current_provider_name == "MiniCPM" else False,
+                    minicpm_config=minicpm_config,
+                    api_key=provider_config.get("api_key") if current_provider_name == "Unsloth" else None
                 )
                 
                 progress_bar = st.progress(0)
