@@ -1,5 +1,6 @@
 data/config.json
 data/system_prompts.json
+data/builder_configs.json
 venv
 __pycache__
 temp_images

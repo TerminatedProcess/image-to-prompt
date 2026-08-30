@@ -7,6 +7,7 @@ from pathlib import Path
 DATA_DIR = Path("data")
 CONFIG_PATH = DATA_DIR / "config.json"
 PROMPTS_PATH = DATA_DIR / "system_prompts.json"
+BUILDER_CONFIGS_PATH = DATA_DIR / "builder_configs.json"
 CONVERSATIONS_DIR = DATA_DIR / "conversations"
 
 # --- Predefined System Prompts ---
@@ -178,6 +179,27 @@ def save_system_prompts(prompts):
     }
     with open(PROMPTS_PATH, 'w') as f:
         json.dump(custom_prompts, f, indent=2)
+
+def load_builder_configs():
+    """Loads saved System Prompt Builder configurations (checkbox/selectbox state).
+
+    Structure: { prompt_name: {caption_type, caption_length, options: [...], name_input},
+                 "__last__": {...} }  where "__last__" is the most recently used state.
+    """
+    ensure_data_dirs()
+    if BUILDER_CONFIGS_PATH.exists():
+        try:
+            with open(BUILDER_CONFIGS_PATH, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+def save_builder_configs(configs):
+    """Saves System Prompt Builder configurations to a JSON file."""
+    ensure_data_dirs()
+    with open(BUILDER_CONFIGS_PATH, 'w') as f:
+        json.dump(configs, f, indent=2)
 
 def save_conversation(conversation_history, filename):
     """Saves a conversation to a file."""

@@ -81,6 +81,65 @@ CAPTION_TYPE_MAP = {
 }
 NAME_OPTION = "If there is a person/character in the image you must refer to them as {name}."
 
+# --- System Prompt Builder options (module-level so callbacks can map them too) ---
+EXTRA_OPTIONS_KEYS = [
+    NAME_OPTION,
+    "Do NOT include information about people/characters that cannot be changed (like ethnicity, gender, etc), but do still include changeable attributes (like hair style).",
+    "Include information about lighting.",
+    "Include information about camera angle.",
+    "Include information about whether there is a watermark or not.",
+    "Include information about whether there are JPEG artifacts or not.",
+    "If it is a photo you MUST include information about what camera was likely used and details such as aperture, shutter speed, ISO, etc.",
+    "Do NOT include anything sexual; keep it PG.",
+    "Do NOT mention the image's resolution.",
+    "You MUST include information about the subjective aesthetic quality of the image from low to very high.",
+    "Include information on the image's composition style, such as leading lines, rule of thirds, or symmetry.",
+    "Do NOT mention any text that is in the image.",
+    "Specify the depth of field and whether the background is in focus or blurred.",
+    "If applicable, mention the likely use of artificial or natural lighting sources.",
+    "Do NOT use any ambiguous language.",
+    "Include whether the image is sfw, suggestive, or nsfw.",
+    "ONLY describe the most important elements of the image.",
+    "If it is a work of art, do not include the artist's name or the title of the work.",
+    "Identify the image orientation (portrait, landscape, or square) and aspect ratio if obvious.",
+    "Use vulgar slang and profanity (such as, but not limited to, \"fucking,\" \"slut,\" \"cock,\") ONLY when it refers to something sexual — the person, their body or body parts, their clothing, their pose or actions, or the erotic mood/ambience of the scene. Do NOT apply vulgar language to neutral or technical subjects such as the camera, lens, lighting equipment, resolution, composition, or scenery that has no sexual connotation.",
+    "Do NOT use polite euphemisms—lean into blunt, casual phrasing.",
+    "Include information about the ages of any people/characters when applicable.",
+    "Mention whether the image depicts an extreme close-up, close-up, medium close-up, medium shot, cowboy shot, medium wide shot, wide shot, or extreme wide shot.",
+    "Do not mention the mood/feeling/etc of the image.",
+    "Explicitly specify the vantage height (eye-level, low-angle worm’s-eye, bird’s-eye, drone, rooftop, etc.).",
+    "If there is a watermark, you must mention it.",
+    'Your response will be used by a text-to-image model, so avoid useless meta phrases like \“This image shows…\", \“You are looking at...\", etc.',
+]
+
+def _current_builder_config():
+    """Snapshot the builder widget state into a serializable dict."""
+    return {
+        "caption_type": st.session_state.get("modal_caption_type", list(CAPTION_TYPE_MAP.keys())[0]),
+        "caption_length": st.session_state.get("modal_caption_length", "any"),
+        "options": [opt for i, opt in enumerate(EXTRA_OPTIONS_KEYS)
+                    if st.session_state.get(f"modal_extra_option_{i}", False)],
+        "name_input": st.session_state.get("modal_name_input", ""),
+    }
+
+def apply_builder_config(cfg):
+    """Push a saved builder config back into the widget session_state keys.
+
+    Must run BEFORE the builder widgets are instantiated this run (i.e. from an
+    on_change callback or init), otherwise Streamlit raises on mutating a
+    widget-backed key after the widget exists.
+    """
+    if not cfg:
+        return
+    if cfg.get("caption_type") in CAPTION_TYPE_MAP:
+        st.session_state["modal_caption_type"] = cfg["caption_type"]
+    if "caption_length" in cfg:
+        st.session_state["modal_caption_length"] = cfg["caption_length"]
+    selected = set(cfg.get("options", []))
+    for i, opt in enumerate(EXTRA_OPTIONS_KEYS):
+        st.session_state[f"modal_extra_option_{i}"] = opt in selected
+    st.session_state["modal_name_input"] = cfg.get("name_input", "")
+
 # --- Page Configuration ---
 st.set_page_config(
     page_title="Image-to-Prompt AI Assistant",
@@ -105,6 +164,13 @@ def init_session_state():
     if "uploader_key" not in st.session_state: st.session_state.uploader_key = str(uuid.uuid4())
     if "generating" not in st.session_state:
         st.session_state.generating = False
+    if "builder_configs" not in st.session_state:
+        st.session_state.builder_configs = cm.load_builder_configs()
+    if "builder_restored" not in st.session_state:
+        # Restore the last-used builder state once per session, before the
+        # builder widgets are instantiated further down the script.
+        apply_builder_config(st.session_state.builder_configs.get("__last__"))
+        st.session_state.builder_restored = True
 
 init_session_state()
 
@@ -717,35 +783,7 @@ with st.sidebar:
         )
 
         st.markdown("**Extra Options**")
-        extra_options_keys = [
-            NAME_OPTION,
-            "Do NOT include information about people/characters that cannot be changed (like ethnicity, gender, etc), but do still include changeable attributes (like hair style).",
-            "Include information about lighting.",
-            "Include information about camera angle.",
-            "Include information about whether there is a watermark or not.",
-            "Include information about whether there are JPEG artifacts or not.",
-            "If it is a photo you MUST include information about what camera was likely used and details such as aperture, shutter speed, ISO, etc.",
-            "Do NOT include anything sexual; keep it PG.",
-            "Do NOT mention the image's resolution.",
-            "You MUST include information about the subjective aesthetic quality of the image from low to very high.",
-            "Include information on the image's composition style, such as leading lines, rule of thirds, or symmetry.",
-            "Do NOT mention any text that is in the image.",
-            "Specify the depth of field and whether the background is in focus or blurred.",
-            "If applicable, mention the likely use of artificial or natural lighting sources.",
-            "Do NOT use any ambiguous language.",
-            "Include whether the image is sfw, suggestive, or nsfw.",
-            "ONLY describe the most important elements of the image.",
-            "If it is a work of art, do not include the artist's name or the title of the work.",
-            "Identify the image orientation (portrait, landscape, or square) and aspect ratio if obvious.",
-            "Use vulgar slang and profanity, such as (but not limited to) \"fucking,\" \"slut,\" \"cock,\" etc.",
-            "Do NOT use polite euphemisms—lean into blunt, casual phrasing.",
-            "Include information about the ages of any people/characters when applicable.",
-            "Mention whether the image depicts an extreme close-up, close-up, medium close-up, medium shot, cowboy shot, medium wide shot, wide shot, or extreme wide shot.",
-            "Do not mention the mood/feeling/etc of the image.",
-            "Explicitly specify the vantage height (eye-level, low-angle worm’s-eye, bird’s-eye, drone, rooftop, etc.).",
-            "If there is a watermark, you must mention it.",
-            'Your response will be used by a text-to-image model, so avoid useless meta phrases like \“This image shows…\", \“You are looking at...\", etc.',
-        ]
+        extra_options_keys = EXTRA_OPTIONS_KEYS
 
         extra_options_state = {}
         for i, option in enumerate(extra_options_keys):
@@ -777,6 +815,9 @@ with st.sidebar:
 
         if st.button("Generate and Apply Prompt", use_container_width=True):
             st.session_state.current_system_prompt = build_prompt(caption_type, caption_length, extra_options_state, name_input)
+            # Remember this builder state so it survives an app restart.
+            st.session_state.builder_configs["__last__"] = _current_builder_config()
+            cm.save_builder_configs(st.session_state.builder_configs)
             st.rerun()
 
     prompt_names = list(st.session_state.system_prompts.keys())
@@ -791,6 +832,11 @@ with st.sidebar:
             st.session_state.current_system_prompt_name = selected_name
             st.session_state.current_system_prompt = st.session_state.system_prompts[selected_name]
             st.session_state.config['last_system_prompt_name'] = selected_name
+            # Repopulate the builder checkboxes from this prompt's saved config
+            # (runs in a callback, before the builder widgets re-instantiate).
+            saved_cfg = st.session_state.builder_configs.get(selected_name)
+            if saved_cfg:
+                apply_builder_config(saved_cfg)
         else:
             st.session_state.current_system_prompt_name = ""
 
@@ -801,6 +847,12 @@ with st.sidebar:
         if prompt_save_name:
             st.session_state.system_prompts[prompt_save_name] = st.session_state.current_system_prompt
             cm.save_system_prompts(st.session_state.system_prompts)
+            # Save the builder checkbox state under this name so it can be
+            # reloaded and tweaked later, and remember it as the last-used state.
+            builder_cfg = _current_builder_config()
+            st.session_state.builder_configs[prompt_save_name] = builder_cfg
+            st.session_state.builder_configs["__last__"] = builder_cfg
+            cm.save_builder_configs(st.session_state.builder_configs)
             st.session_state.current_system_prompt_name = prompt_save_name
             st.session_state.config['last_system_prompt_name'] = prompt_save_name
             st.toast(f"Prompt '{prompt_save_name}' saved!", icon="✅"); st.rerun()
