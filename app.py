@@ -157,6 +157,8 @@ def init_session_state():
         last_prompt_name = st.session_state.config.get("last_system_prompt_name", "Default Image-to-Prompt")
         st.session_state.current_system_prompt = st.session_state.system_prompts.get(last_prompt_name, st.session_state.system_prompts.get("Default Image-to-Prompt", ""))
         st.session_state.current_system_prompt_name = last_prompt_name
+    if "system_prompt_text_area" not in st.session_state:
+        st.session_state["system_prompt_text_area"] = st.session_state.current_system_prompt
     if "uploaded_files" not in st.session_state: st.session_state.uploaded_files = []
     if "uploaded_videos" not in st.session_state: st.session_state.uploaded_videos = []
     if "metadata_extractor" not in st.session_state: st.session_state.metadata_extractor = ImageMetadataExtractor()
@@ -814,7 +816,12 @@ with st.sidebar:
             )
 
         if st.button("Generate and Apply Prompt", use_container_width=True):
-            st.session_state.current_system_prompt = build_prompt(caption_type, caption_length, extra_options_state, name_input)
+            built_prompt = build_prompt(caption_type, caption_length, extra_options_state, name_input)
+            st.session_state.current_system_prompt = built_prompt
+            # Push it into the text-area's own keyed state too, otherwise the
+            # widget keeps showing its previous value (Streamlit uses the keyed
+            # state over the `value=` arg once the widget has been rendered).
+            st.session_state["system_prompt_text_area"] = built_prompt
             # Remember this builder state so it survives an app restart.
             st.session_state.builder_configs["__last__"] = _current_builder_config()
             cm.save_builder_configs(st.session_state.builder_configs)
@@ -831,6 +838,7 @@ with st.sidebar:
         if selected_name != "New Custom Prompt":
             st.session_state.current_system_prompt_name = selected_name
             st.session_state.current_system_prompt = st.session_state.system_prompts[selected_name]
+            st.session_state["system_prompt_text_area"] = st.session_state.system_prompts[selected_name]
             st.session_state.config['last_system_prompt_name'] = selected_name
             # Repopulate the builder checkboxes from this prompt's saved config
             # (runs in a callback, before the builder widgets re-instantiate).
@@ -841,7 +849,8 @@ with st.sidebar:
             st.session_state.current_system_prompt_name = ""
 
     st.selectbox("Choose or create a prompt", options=["New Custom Prompt"] + prompt_names, index=current_prompt_index, on_change=on_prompt_change, key="prompt_selector", disabled=st.session_state.generating)
-    st.session_state.current_system_prompt = st.text_area("System Prompt Content", value=st.session_state.current_system_prompt, height=200, key="system_prompt_text_area", disabled=st.session_state.generating)
+    st.text_area("System Prompt Content", height=200, key="system_prompt_text_area", disabled=st.session_state.generating)
+    st.session_state.current_system_prompt = st.session_state["system_prompt_text_area"]
     prompt_save_name = st.text_input("Enter name to save prompt:", value=st.session_state.get("current_system_prompt_name", ""), disabled=st.session_state.generating)
     if st.button("Save System Prompt", disabled=st.session_state.generating):
         if prompt_save_name:
