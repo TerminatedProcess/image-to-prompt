@@ -199,6 +199,13 @@ def init_session_state():
     if "build_loras" not in st.session_state: st.session_state.build_loras = []
     if "last_result_hash" not in st.session_state: st.session_state.last_result_hash = None
     if "last_assessment" not in st.session_state: st.session_state.last_assessment = None
+    # --- Workspace (two-panel) state ---
+    if "pv_before" not in st.session_state: st.session_state.pv_before = None
+    if "pv_prompt" not in st.session_state: st.session_state.pv_prompt = ""
+    if "pv_runs" not in st.session_state: st.session_state.pv_runs = []
+    if "pv_view" not in st.session_state: st.session_state.pv_view = None
+    if "pv_counter" not in st.session_state: st.session_state.pv_counter = 0
+    if "pv_result_uploader_key" not in st.session_state: st.session_state.pv_result_uploader_key = str(uuid.uuid4())
 
 init_session_state()
 
@@ -551,7 +558,7 @@ def current_best_prompt():
         return st.session_state.messages[base].get("content", "")
     return ""
 
-def run_vision_review(target_paths, prev_path, new_path, current_prompt):
+def run_vision_review(target_paths, prev_path, new_path, current_prompt, history=None):
     """Send [targets..., prev?, new] to the vision model and parse its verdict."""
     provider = st.session_state.config["api_provider"]
     models = st.session_state.config["providers"].get(provider, {}).get("selected_models", [])
@@ -561,7 +568,9 @@ def run_vision_review(target_paths, prev_path, new_path, current_prompt):
     if prev_path:
         images.append(Path(prev_path))
     images.append(Path(new_path))
-    user_msg = build_user_message(current_prompt, refine_history(), n_targets=len(target_paths),
+    if history is None:
+        history = []
+    user_msg = build_user_message(current_prompt, history, n_targets=len(target_paths),
                                   has_prev=bool(prev_path),
                                   mirror_tolerant=st.session_state.get("mirror_tolerant", False))
     api_messages = [{"role": "system", "content": REFINE_SYSTEM}, {"role": "user", "content": user_msg}]
@@ -728,9 +737,9 @@ def configure_backend_generation(backend):
     else:
         backend.set_build_config(None)
     if hasattr(backend, "set_img2img"):
-        targets = get_starting_image_paths()
-        if st.session_state.get("img2img_ref") and targets:
-            backend.set_img2img({"init_path": str(targets[0]),
+        ref = pv_before_path()
+        if st.session_state.get("img2img_ref") and ref:
+            backend.set_img2img({"init_path": str(ref),
                                  "strength": float(st.session_state.get("img2img_strength", 0.6))})
         else:
             backend.set_img2img(None)
@@ -1788,6 +1797,382 @@ window.addEventListener('load', function() {
 </script>
 """, unsafe_allow_html=True)
 
+# ======================= Workspace (two-panel) =======================
+def pv_before_path():
+    b = st.session_state.get("pv_before")
+    if b and Path(b).exists():
+        return Path(b)
+    starts = get_starting_image_paths()
+    return starts[0] if starts else None
+
+def pv_history():
+    return [{"prompt": r["prompt"], "assessment": r.get("assessment", "")}
+            for r in st.session_state.pv_runs]
+
+def pv_last_after():
+    runs = st.session_state.pv_runs
+    if runs and Path(runs[-1]["after"]).exists():
+        return Path(runs[-1]["after"])
+    return None
+
+def pv_first_model():
+    provider = st.session_state.config["api_provider"]
+    models = st.session_state.config["providers"].get(provider, {}).get("selected_models", [])
+    return models[0] if models else None
+
+def pv_add_run(before, after, prompt, seed, source, decision=None, assessment=None):
+    st.session_state.pv_counter += 1
+    run = {"id": str(uuid.uuid4()), "n": st.session_state.pv_counter,
+           "before": str(before) if before else None, "after": str(after),
+           "prompt": prompt, "seed": seed, "source": source,
+           "decision": decision, "assessment": assessment}
+    st.session_state.pv_runs.append(run)
+    st.session_state.pv_view = None
+    return run
+
+def pv_analyze():
+    ref = pv_before_path()
+    if not ref:
+        st.warning("Add a starting image first."); return
+    model = pv_first_model()
+    if not model:
+        st.warning("Select a vision model in the sidebar."); return
+    api_messages = [{"role": "system", "content": st.session_state.current_system_prompt},
+                    {"role": "user", "content": "Describe the attached image according to the system prompt."}]
+    client = make_api_client()
+    full = ""
+    with st.spinner("Analyzing image…"):
+        for chunk in client.generate_chat_response(model=model, messages=api_messages, images=[ref], videos=[]):
+            full += chunk
+    st.session_state.pv_prompt = remove_thinking_tags(full).strip()
+
+def pv_generate(source="generate"):
+    prompt = st.session_state.pv_prompt.strip()
+    if not prompt:
+        st.warning("Analyze the image or type a prompt first."); return False
+    backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
+    configure_backend_generation(backend)
+    try:
+        if not st.session_state.get("gen_build_mode"):
+            backend.prepare()
+        gen_prompt, _ = apply_lora_triggers(prompt, backend)
+        with st.spinner(f"Generating in {backend.display_name}…"):
+            res = backend.generate(gen_prompt, params={"seed": None})
+    except Exception as e:
+        st.error(f"{backend.display_name} generation failed: {e}"); return False
+    pv_add_run(before=pv_before_path(), after=res.image_path, prompt=prompt, seed=res.seed, source=source)
+    return True
+
+def pv_drop_result(path, name):
+    """A user-supplied result: review it against the reference and record a run."""
+    ref = pv_before_path()
+    prompt = st.session_state.pv_prompt.strip()
+    if not ref:
+        st.warning("Add a starting image first."); return
+    try:
+        with st.spinner("Reviewing dropped result against the reference…"):
+            verdict = run_vision_review([ref], pv_last_after(), path, prompt, history=pv_history())
+    except Exception as e:
+        st.error(f"Review failed: {e}"); return
+    pv_add_run(before=ref, after=path, prompt=prompt or verdict["prompt"], seed=None,
+               source="dropped", decision=verdict["decision"], assessment=verdict["assessment"])
+    st.session_state.pv_prompt = verdict["prompt"]
+
+def pv_clear():
+    st.session_state.pv_prompt = ""
+    st.session_state.pv_runs = []
+    st.session_state.pv_view = None
+    st.session_state.pv_counter = 0
+    st.session_state.pv_before = None
+    st.session_state.auto_running = False
+    st.session_state.auto_iter = 0
+    st.session_state.auto_stop = False
+    st.session_state.plateau_count = 0
+    st.session_state.auto_summary = ""
+    st.session_state.auto_phase = "fixed"
+    st.session_state.last_result_hash = None
+    st.session_state.last_assessment = None
+    st.session_state.pv_result_uploader_key = str(uuid.uuid4())
+
+def pv_start_auto():
+    import random
+    backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
+    configure_backend_generation(backend)
+    build_mode = bool(st.session_state.get("gen_build_mode"))
+    if not build_mode:
+        try:
+            backend.prepare()
+        except Exception as e:
+            st.session_state.auto_summary = f"Could not start: {e}"; return
+    seed = get_target_seed()
+    if seed is None and not build_mode:
+        seed = backend.current_seed() if hasattr(backend, "current_seed") else None
+    if seed is None:
+        seed = random.randint(0, 2**31 - 1)
+    st.session_state.fixed_seed = seed
+    strategy = st.session_state.get("refine_seed_strategy", "fixed_then_random")
+    st.session_state.auto_phase = "random" if strategy == "random" else "fixed"
+    st.session_state.auto_running = True
+    st.session_state.auto_iter = 0
+    st.session_state.auto_stop = False
+    st.session_state.plateau_count = 0
+    st.session_state.auto_summary = ""
+    st.session_state.last_result_hash = None
+    st.session_state.last_assessment = None
+    st.rerun()
+
+def pv_auto_step():
+    max_iters = int(st.session_state.get("refine_max_iters", 5))
+    plateau_n = int(st.session_state.get("refine_plateau_n", 2))
+    runs = st.session_state.pv_runs
+    last_decision = runs[-1]["decision"] if runs else None
+    if st.session_state.auto_stop:
+        stop_auto("Stopped by user."); st.rerun(); return
+    if st.session_state.auto_iter >= max_iters:
+        stop_auto(f"Reached the max of {max_iters} iterations."); st.rerun(); return
+    if last_decision == "DONE":
+        stop_auto("The model judged the prompt is as good as it will get."); st.rerun(); return
+    if st.session_state.plateau_count >= plateau_n:
+        strategy = st.session_state.get("refine_seed_strategy", "fixed_then_random")
+        if strategy == "fixed_then_random" and st.session_state.auto_phase == "fixed":
+            st.session_state.auto_phase = "random"; st.session_state.plateau_count = 0
+            st.session_state.auto_summary = "Prompt-only refinement plateaued — randomizing the seed to explore compositions."
+        else:
+            stop_auto(f"No improvement for {plateau_n} rounds — stopping."); st.rerun(); return
+
+    backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
+    configure_backend_generation(backend)
+    target = pv_before_path()
+    if not target:
+        stop_auto("No reference image — stopping."); st.rerun(); return
+    prompt = st.session_state.pv_prompt.strip()
+    if not prompt:
+        stop_auto("No prompt yet — Analyze first."); st.rerun(); return
+    prev = pv_last_after()
+    strategy = st.session_state.get("refine_seed_strategy", "fixed_then_random")
+    use_seed = None if (strategy == "random" or st.session_state.auto_phase == "random") else st.session_state.fixed_seed
+    gen_prompt, _added = apply_lora_triggers(prompt, backend)
+    try:
+        label = "random seed" if use_seed is None else f"fixed seed {use_seed}"
+        with st.status(f"Auto-refine {st.session_state.auto_iter + 1}/{max_iters} ({label})…", expanded=True) as status:
+            res = backend.generate(gen_prompt, params={"seed": use_seed}, progress=lambda m: status.update(label=m))
+            new_hash = _image_hash(res.image_path)
+            prev_hash = st.session_state.last_result_hash
+            if use_seed is not None and prev_hash and new_hash == prev_hash:
+                if strategy == "fixed_then_random" and st.session_state.auto_phase == "fixed":
+                    st.session_state.auto_phase = "random"
+                    st.session_state.auto_summary = "Identical image at fixed seed — switching to random seeds."
+                    status.update(label="Identical image — switching to random seeds", state="complete")
+                    st.rerun(); return
+                stop_auto("Fixed seed keeps producing the same image — try Random or Fixed-then-random.")
+                st.rerun(); return
+            status.update(label="Reviewing against the reference…")
+            verdict = run_vision_review([target], prev, res.image_path, prompt, history=pv_history())
+            status.update(label=f"Iteration {st.session_state.auto_iter + 1}: {verdict['decision']} (seed {res.seed})", state="complete")
+    except Exception as e:
+        stop_auto(f"Generation failed: {e}"); st.rerun(); return
+
+    image_changed = (prev_hash is None) or (new_hash != prev_hash)
+    assessment_changed = not _text_similar(verdict["assessment"], st.session_state.last_assessment)
+    st.session_state.last_result_hash = new_hash
+    st.session_state.last_assessment = verdict["assessment"]
+    pv_add_run(before=target, after=res.image_path, prompt=prompt, seed=res.seed,
+               source=f"auto #{st.session_state.auto_iter + 1}",
+               decision=verdict["decision"], assessment=verdict["assessment"])
+    st.session_state.pv_prompt = verdict["prompt"]
+    update_after_verdict(verdict, prompt, image_changed=image_changed, assessment_changed=assessment_changed)
+    st.session_state.auto_iter += 1
+    st.rerun()
+
+def render_auto_controls():
+    """Auto-refine loop controls for the workspace (wired to the pv_* model)."""
+    with st.expander("🤖 Auto-refine loop (generate → review → repeat)", expanded=st.session_state.auto_running):
+        names = image_backends.backend_display_names()
+        st.selectbox("Image-generation backend", options=list(names.keys()),
+                     format_func=lambda k: names[k], key="refine_backend",
+                     disabled=st.session_state.auto_running)
+        backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
+        stt = backend.status()
+        st.caption(("✅ " if stt.available else "❌ ") + stt.detail)
+        render_build_controls(backend)
+
+        c1, c2 = st.columns(2)
+        c1.number_input("Max iterations", 1, 25, value=5, key="refine_max_iters", disabled=st.session_state.auto_running)
+        c2.number_input("Stop after N non-improving rounds", 1, 10, value=2, key="refine_plateau_n", disabled=st.session_state.auto_running)
+        seed_labels = {"fixed_then_random": "Fixed, then randomize on plateau (recommended)",
+                       "fixed": "Fixed seed only", "random": "Random seed each cycle"}
+        st.selectbox("Seed strategy", options=list(seed_labels.keys()), format_func=lambda k: seed_labels[k],
+                     key="refine_seed_strategy", disabled=st.session_state.auto_running)
+        if backend.id == "invokeai":
+            st.checkbox("Lock composition to the reference (img2img)", key="img2img_ref",
+                        disabled=st.session_state.auto_running,
+                        help="Use the reference image as the init so pose/orientation/framing are inherited.")
+            if st.session_state.get("img2img_ref"):
+                st.slider("Restyle strength", 0.2, 0.95, value=0.6, step=0.05, key="img2img_strength",
+                          disabled=st.session_state.auto_running)
+        st.checkbox("Ignore left/right flips (mirror-tolerant)", key="mirror_tolerant", disabled=st.session_state.auto_running)
+
+        if not st.session_state.auto_running:
+            if st.button("▶ Start auto-refine", type="primary", use_container_width=True,
+                         disabled=not stt.available or not st.session_state.pv_prompt.strip()):
+                pv_start_auto()
+            if not st.session_state.pv_prompt.strip():
+                st.caption("Analyze the image (or type a prompt) first.")
+        else:
+            if st.button("⏹ Stop", type="primary", use_container_width=True):
+                st.session_state.auto_stop = True; st.rerun()
+            st.caption(f"Running… iteration {st.session_state.auto_iter}/{int(st.session_state.get('refine_max_iters',5))} "
+                       f"· phase {st.session_state.auto_phase} · plateau {st.session_state.plateau_count}/{int(st.session_state.get('refine_plateau_n',2))} "
+                       "· (Stop takes effect after the current image finishes)")
+        if st.session_state.auto_summary:
+            st.info(st.session_state.auto_summary)
+
+def render_workspace():
+    st.markdown("""
+    <style>
+      .pv-num{font-weight:700;opacity:.7}
+      div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:14px}
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ---- Starting images (targets) ----
+    with st.container(border=True):
+        st.markdown("#### 🎯 Starting image(s)")
+        up = st.file_uploader("Upload the target image(s)", type=["png", "jpg", "jpeg", "webp"],
+                              accept_multiple_files=True, key=st.session_state.uploader_key,
+                              label_visibility="collapsed")
+        if up:
+            st.session_state.uploaded_files = [save_uploaded_file(f) for f in up]
+        starts = get_starting_image_paths()
+        if starts:
+            cols = st.columns(min(6, len(starts)))
+            for i, p in enumerate(starts):
+                with cols[i % len(cols)]:
+                    st.image(str(p), use_container_width=True)
+        else:
+            st.caption("Drop a target image to begin.")
+
+    # ================= TOP PANEL: current / snapshot =================
+    with st.container(border=True):
+        viewing = st.session_state.pv_view
+        run = next((r for r in st.session_state.pv_runs if r["id"] == viewing), None) if viewing else None
+
+        if run:  # ---- viewing a past snapshot ----
+            hc1, hc2 = st.columns([3, 1])
+            hc1.markdown(f"#### 📸 Viewing run #{run['n']}  ·  {run['source']}")
+            if hc2.button("↩ Back to latest", use_container_width=True):
+                st.session_state.pv_view = None; st.rerun()
+            ic1, ic2 = st.columns(2)
+            with ic1:
+                st.caption("Before (reference)")
+                if run["before"] and Path(run["before"]).exists():
+                    st.image(run["before"], use_container_width=True)
+            with ic2:
+                badge = {"IMPROVE": "🟢", "REVERT": "🟠", "DONE": "✅"}.get(run.get("decision"), "")
+                st.caption(f"After  {badge} {run.get('decision') or ''}"
+                           + (f" · seed {run['seed']}" if run.get('seed') is not None else ""))
+                if Path(run["after"]).exists():
+                    st.image(run["after"], use_container_width=True)
+            if run.get("assessment"):
+                st.caption(run["assessment"])
+            with st.popover("Prompt", use_container_width=True):
+                st.code(run["prompt"], language=None)
+            rc1, rc2 = st.columns(2)
+            if rc1.button("⤴ Restore to current", type="primary", use_container_width=True):
+                st.session_state.pv_before = run["before"]
+                st.session_state.pv_prompt = run["prompt"]
+                st.session_state.pv_view = None; st.rerun()
+            rc2.caption("")
+
+        else:  # ---- live current state ----
+            hc1, hc2 = st.columns([3, 1])
+            hc1.markdown("#### ✨ Current")
+            if hc2.button("🧹 Clear", use_container_width=True, disabled=st.session_state.auto_running,
+                          help="Clear the prompt, results and history — keeps the starting image(s)."):
+                pv_clear(); st.rerun()
+
+            rcol, pcol = st.columns([1, 2])
+            with rcol:
+                ref = pv_before_path()
+                st.caption("Reference (before)")
+                if ref:
+                    st.image(str(ref), use_container_width=True)
+                rup = st.file_uploader("Replace reference", type=["png", "jpg", "jpeg", "webp"],
+                                       accept_multiple_files=False, key="pv_ref_uploader",
+                                       label_visibility="collapsed", disabled=st.session_state.auto_running)
+                if rup is not None:
+                    p, _n = save_uploaded_file(rup)
+                    st.session_state.pv_before = str(p); st.rerun()
+            with pcol:
+                st.text_area("Prompt", key="pv_prompt", height=200,
+                             disabled=st.session_state.auto_running,
+                             placeholder="Analyze the reference, or type a prompt…")
+                b1, b2, b3 = st.columns(3)
+                if b1.button("🔍 Analyze", use_container_width=True, disabled=st.session_state.auto_running):
+                    pv_analyze(); st.rerun()
+                if b2.button("🎨 Generate", type="primary", use_container_width=True, disabled=st.session_state.auto_running):
+                    if pv_generate("generate"):
+                        st.rerun()
+                if st.session_state.pv_prompt.strip():
+                    b3.button("📋 copy", use_container_width=True, disabled=True)
+
+            # results strip (newest first)
+            if st.session_state.pv_runs:
+                st.caption("Results")
+                recent = list(reversed(st.session_state.pv_runs))[:6]
+                rcols = st.columns(len(recent))
+                for i, r in enumerate(recent):
+                    with rcols[i]:
+                        if Path(r["after"]).exists():
+                            st.image(r["after"], use_container_width=True)
+                        st.caption(f"#{r['n']}")
+                        if st.button("⤴ ref", key=f"pv_setref_{r['id']}", use_container_width=True,
+                                     help="Use this result as the reference", disabled=st.session_state.auto_running):
+                            st.session_state.pv_before = r["after"]; st.rerun()
+
+            # drop an external result
+            drop = st.file_uploader("⬇ Drop a generated result to review & record",
+                                    type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=False,
+                                    key=st.session_state.pv_result_uploader_key,
+                                    disabled=st.session_state.auto_running)
+            if drop is not None and not st.session_state.auto_running:
+                sig = f"{drop.name}:{drop.size}"
+                if sig != st.session_state.get("pv_last_drop_sig"):
+                    st.session_state.pv_last_drop_sig = sig
+                    p, n = save_uploaded_file(drop)
+                    pv_drop_result(p, n); st.rerun()
+
+            render_auto_controls()
+
+    # ================= BOTTOM PANEL: history =================
+    with st.container(border=True):
+        st.markdown("#### 🗂 History")
+        with st.container(height=460):
+            # row 0 = latest / live
+            lc1, lc2 = st.columns([1, 5])
+            lc1.markdown("**⭐**")
+            if lc2.button("Latest (live)", key="pv_latest", use_container_width=True,
+                          type="secondary" if st.session_state.pv_view else "primary"):
+                st.session_state.pv_view = None; st.rerun()
+            for r in reversed(st.session_state.pv_runs):
+                with st.container(border=True):
+                    cc = st.columns([1, 2, 2, 4])
+                    cc[0].markdown(f"<span class='pv-num'>#{r['n']}</span>", unsafe_allow_html=True)
+                    if r["before"] and Path(r["before"]).exists():
+                        cc[1].image(r["before"], use_container_width=True)
+                    if Path(r["after"]).exists():
+                        cc[2].image(r["after"], use_container_width=True)
+                    with cc[3]:
+                        badge = {"IMPROVE": "🟢", "REVERT": "🟠", "DONE": "✅"}.get(r.get("decision"), "")
+                        st.caption(f"{r['source']} {badge} {r.get('decision') or ''}")
+                        st.caption((r["prompt"] or "")[:110] + ("…" if len(r["prompt"] or "") > 110 else ""))
+                        if st.button("view", key=f"pv_view_{r['id']}", use_container_width=True):
+                            st.session_state.pv_view = r["id"]; st.rerun()
+
+    if st.session_state.auto_running:
+        pv_auto_step()
+
+
 # --- Main Application Area ---
 st.title("🖼️ Image-to-Prompt AI Assistant")
 st.warning("**Important:** For local models, ensure **LM Studio** or **Ollama** is running with the API server enabled and a vision model loaded. For Google, ensure you have entered a valid API key.")
@@ -1795,198 +2180,7 @@ st.warning("**Important:** For local models, ensure **LM Studio** or **Ollama** 
 tab1, tab2, tab3 = st.tabs(["Chat", "Bulk Analysis", "Recommended Models"])
 
 with tab1:
-    # Create a list of containers for each message so we can update them in-place
-    message_containers = []
-    for idx, message in enumerate(st.session_state.messages):
-        container = st.container()
-        message_containers.append(container)
-        with container:
-            col_msg, col_copy, col_btn, col_regen = st.columns([8, 1, 1, 1])
-            with col_msg:
-                if "display_content" in message:
-                    st.markdown(message["display_content"])
-                if "images" in message:
-                    img_cols = st.columns(len(message["images"]))
-                    for j, image_info in enumerate(message["images"]):
-                        with img_cols[j]:
-                            img_path = Path(image_info["path"])
-                            if img_path.exists():
-                                st.image(str(img_path), width=150)
-                                with st.popover("View Full Size", use_container_width=True):
-                                    st.image(str(img_path))
-                                st.caption(image_info["name"])
-                if "videos" in message:
-                    # Create more columns to make videos smaller
-                    num_videos = len(message["videos"])
-                    # Use more columns than videos to create smaller containers
-                    video_cols = st.columns([1, 2, 1] if num_videos == 1 else [2] * num_videos + [1] * max(0, 3 - num_videos))
-                    for j, video_info in enumerate(message["videos"]):
-                        col_index = 1 if num_videos == 1 else j  # Center single video, otherwise use sequential columns
-                        with video_cols[col_index]:
-                            video_path = Path(video_info["path"])
-                            if video_path.exists():
-                                st.markdown('<div class="video-thumbnail-small">', unsafe_allow_html=True)
-                                st.video(str(video_path))
-                                st.markdown('</div>', unsafe_allow_html=True)
-                                st.caption(video_info["name"])
-                # "Generate this prompt" button under any assistant prompt
-                if message.get("role") == "assistant" and (message.get("content") or "").strip():
-                    _bn = image_backends.backend_display_names().get(st.session_state.get("refine_backend", "invokeai"), "InvokeAI")
-                    gcols = st.columns([3, 1])
-                    with gcols[1]:
-                        if st.button("🎨 Generate", key=f"gen_msg_{idx}", help=f"Generate this prompt in {_bn}",
-                                     use_container_width=True, disabled=st.session_state.auto_running):
-                            if generate_prompt_in_backend(message["content"]):
-                                st.rerun()
-            with col_copy:
-                if message.get('role') == 'assistant':
-                    copy_button(message.get("content") or message.get("display_content", ""), key=f"copy_msg_{idx}")
-            with col_btn:
-                if st.button("×", key=f"remove_msg_{idx}", help="Delete this message"):
-                    remove_message(idx)
-            with col_regen:
-                if message.get('role') == 'assistant':
-                    if st.button("↻", key=f"regen_msg_{idx}", help="Regenerate this message"):
-                        regenerate_message(idx, message_containers[idx])
-
-    if st.session_state.generating:
-        run_generation_logic()
-    else:
-        current_provider = st.session_state.config.get("api_provider", "Ollama")
-        
-        # Image upload section
-        st.subheader("Starting Images")
-        uploaded_files_from_widget = st.file_uploader(
-            "Upload image(s)", 
-            type=["png", "jpg", "jpeg", "webp"],
-            accept_multiple_files=True,  # Allow multiple images
-            key=st.session_state.uploader_key
-        )
-
-        if uploaded_files_from_widget:
-            # Process multiple uploaded files
-            new_uploads = [save_uploaded_file(file) for file in uploaded_files_from_widget]
-            st.session_state.uploaded_files = new_uploads
-        elif not st.session_state.uploaded_files:
-            # Initialize to empty list if nothing uploaded and no existing files
-            st.session_state.uploaded_files = []
-        
-
-        
-        # Video upload section (for Google and MiniCPM)
-        if current_provider in ["Google", "MiniCPM"]:
-            provider_text = "Google & MiniCPM" if current_provider == "MiniCPM" else "Google Only"
-            st.subheader(f"Upload Videos ({provider_text})")
-            uploaded_videos_from_widget = st.file_uploader(
-                "Upload video(s)", 
-                type=["mp4", "avi", "mov", "mkv", "webm", "flv", "wmv", "m4v"],
-                accept_multiple_files=True,
-                key=f"video_{st.session_state.uploader_key}"
-            )
-
-            if uploaded_videos_from_widget:
-                # Process multiple uploaded video files
-                new_video_uploads = [save_uploaded_video(file) for file in uploaded_videos_from_widget]
-                st.session_state.uploaded_videos = new_video_uploads
-            elif not st.session_state.uploaded_videos:
-                # Initialize to empty list if nothing uploaded and no existing files
-                st.session_state.uploaded_videos = []
-        else:
-            # Clear videos if not using Google or MiniCPM
-            st.session_state.uploaded_videos = []
-        
-        # Display all uploaded images in a grid
-        if st.session_state.uploaded_files:
-            st.write("**Uploaded Images:**")
-            num_images = len(st.session_state.uploaded_files)
-            cols_per_row = min(4, num_images)  # Maximum 4 images per row
-            
-            # Calculate how many rows we need
-            num_rows = (num_images + cols_per_row - 1) // cols_per_row
-            
-            # Create a grid to display images
-            for row in range(num_rows):
-                cols = st.columns(cols_per_row)
-                for col_idx in range(cols_per_row):
-                    img_idx = row * cols_per_row + col_idx
-                    if img_idx < num_images:
-                        file_path, original_name = st.session_state.uploaded_files[img_idx]
-                        with cols[col_idx]:
-                            st.image(str(file_path), caption=original_name, width=150)
-                            if st.button("×", key=f"remove_img_{img_idx}", disabled=st.session_state.auto_running):
-                                remove_uploaded_image(img_idx)
-                            with st.popover("View Full Size", use_container_width=True):
-                                st.image(str(file_path))
-                            
-                            # Display metadata below the image
-                            display_image_metadata(file_path, original_name)
-
-        # Resulting Images: compare & refine loop
-        render_refine_section(current_provider)
-
-        # Display all uploaded videos in a grid (for Google and MiniCPM)
-        if st.session_state.uploaded_videos and current_provider in ["Google", "MiniCPM"]:
-            st.write("**Uploaded Videos:**")
-            num_videos = len(st.session_state.uploaded_videos)
-            cols_per_row = min(4, num_videos)  # Maximum 4 videos per row for smaller thumbnails
-            
-            # Calculate how many rows we need
-            num_rows = (num_videos + cols_per_row - 1) // cols_per_row
-            
-            # Create a grid to display videos with smaller columns
-            for row in range(num_rows):
-                # Create columns with specific widths to make videos smaller
-                if cols_per_row == 1:
-                    cols = st.columns([1, 2, 1])  # Center single video
-                    active_cols = [1]
-                elif cols_per_row == 2:
-                    cols = st.columns([1, 2, 1, 2, 1])  # Two videos with spacing
-                    active_cols = [1, 3]
-                else:
-                    cols = st.columns(cols_per_row + 2)  # Add padding columns
-                    active_cols = list(range(1, cols_per_row + 1))
-                
-                for col_idx in range(cols_per_row):
-                    vid_idx = row * cols_per_row + col_idx
-                    if vid_idx < num_videos:
-                        file_path, original_name = st.session_state.uploaded_videos[vid_idx]
-                        with cols[active_cols[col_idx] if col_idx < len(active_cols) else col_idx]:
-                            st.markdown('<div class="video-thumbnail">', unsafe_allow_html=True)
-                            st.video(str(file_path))
-                            st.markdown('</div>', unsafe_allow_html=True)
-                            st.caption(original_name)
-                            if st.button("×", key=f"remove_vid_{vid_idx}"):
-                                remove_uploaded_video(vid_idx)
-        
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            has_media = bool(st.session_state.uploaded_files or st.session_state.uploaded_videos)
-            if has_media:
-                media_text = []
-                if st.session_state.uploaded_files:
-                    media_text.append("Image(s)")
-                if st.session_state.uploaded_videos:
-                    media_text.append("Video(s)")
-                button_text = f"Analyze {' & '.join(media_text)}"
-                if st.button(button_text):
-                    process_and_send_message(
-                        prompt_text="", 
-                        uploaded_file_info=st.session_state.uploaded_files,
-                        uploaded_video_info=st.session_state.uploaded_videos
-                    )
-        with col2:
-            # Chat input
-            if prompt := st.chat_input("Type your message here..."):
-                process_and_send_message(
-                    prompt_text=prompt,
-                    uploaded_file_info=st.session_state.uploaded_files,
-                    uploaded_video_info=st.session_state.uploaded_videos
-                )
-
-        # Auto-refine driver: run one generate→review step per rerun so the Stop
-        # button and the progress gallery stay responsive between iterations.
-        if st.session_state.auto_running:
-            run_auto_step()
+    render_workspace()
 
 with tab2:
     bulk_analysis_page()
