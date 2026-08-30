@@ -4,7 +4,8 @@ import streamlit.components.v1 as components
 import os
 import json
 import uuid
-import copy 
+import copy
+import hashlib
 from datetime import datetime
 from pathlib import Path
 import html
@@ -191,6 +192,8 @@ def init_session_state():
     if "auto_phase" not in st.session_state: st.session_state.auto_phase = "fixed"
     if "fixed_seed" not in st.session_state: st.session_state.fixed_seed = None
     if "inject_lora_triggers" not in st.session_state: st.session_state.inject_lora_triggers = True
+    if "last_result_hash" not in st.session_state: st.session_state.last_result_hash = None
+    if "last_assessment" not in st.session_state: st.session_state.last_assessment = None
 
 init_session_state()
 
@@ -366,6 +369,8 @@ def reset_refine_state():
     st.session_state.auto_summary = ""
     st.session_state.auto_phase = "fixed"
     st.session_state.fixed_seed = None
+    st.session_state.last_result_hash = None
+    st.session_state.last_assessment = None
 
 def start_new_chat():
     st.session_state.messages = []; st.session_state.chat_id = None; st.session_state.uploaded_files = []
@@ -589,12 +594,31 @@ def record_refine_step(new_path, new_name, used_prompt, verdict, source, seed=No
 def _norm_prompt(s):
     return " ".join((s or "").split()).lower()
 
-def update_after_verdict(verdict, used_prompt):
-    # A round only counts as progress when the model says IMPROVE *and* actually
-    # changed the prompt. REVERT, DONE, or IMPROVE-without-change all count as
-    # non-improving, so "stop after N non-improving rounds" behaves as labelled.
-    changed = _norm_prompt(verdict["prompt"]) != _norm_prompt(used_prompt)
-    if verdict["decision"] == "IMPROVE" and changed:
+def _image_hash(path):
+    try:
+        return hashlib.md5(Path(path).read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+def _text_similar(a, b, threshold=0.85):
+    """Word-Jaccard similarity — used to detect the model repeating its critique."""
+    if not a or not b:
+        return False
+    wa = set(_norm_prompt(a).split())
+    wb = set(_norm_prompt(b).split())
+    if not wa or not wb:
+        return False
+    return len(wa & wb) / len(wa | wb) >= threshold
+
+def update_after_verdict(verdict, used_prompt, image_changed=True, assessment_changed=True):
+    # A round only counts as PROGRESS when the model says IMPROVE *and* the prompt
+    # changed *and* the image actually changed *and* the critique changed. Relying
+    # on the model's "IMPROVE" alone lets an over-optimistic local model spin on an
+    # identical image forever; the objective signals below stop that.
+    prompt_changed = _norm_prompt(verdict["prompt"]) != _norm_prompt(used_prompt)
+    progressing = (verdict["decision"] == "IMPROVE" and prompt_changed
+                   and image_changed and assessment_changed)
+    if progressing:
         st.session_state.plateau_count = 0
     else:
         st.session_state.plateau_count += 1
@@ -751,14 +775,36 @@ def run_auto_step():
             if added_trigs:
                 prog(f"Added LoRA triggers: {', '.join(added_trigs)}")
             res = backend.generate(gen_prompt, params={"seed": use_seed}, progress=prog)
+
+            # Objective stagnation check: if a FIXED seed produced a byte-identical
+            # image, the seed is dominating and prompt edits do nothing — jump to
+            # random seeds (or stop) instead of wasting a review on a duplicate.
+            new_hash = _image_hash(res.image_path)
+            prev_hash = st.session_state.last_result_hash
+            if use_seed is not None and prev_hash and new_hash == prev_hash:
+                strat = st.session_state.get("refine_seed_strategy", "fixed_then_random")
+                if strat == "fixed_then_random" and st.session_state.auto_phase == "fixed":
+                    st.session_state.auto_phase = "random"
+                    st.session_state.auto_summary = "Fixed seed produced an identical image — switching to random seeds to explore compositions."
+                    status.update(label="Identical image at fixed seed — switching to random seeds", state="complete")
+                    st.rerun(); return
+                stop_auto("Fixed seed keeps producing the same image — prompt edits aren't moving it. "
+                          "Try the 'Random' or 'Fixed, then randomize' seed strategy.")
+                st.rerun(); return
+
             prog("Reviewing result against the target…")
             verdict = run_vision_review(targets, prev, res.image_path, prompt)
             status.update(label=f"Iteration {st.session_state.auto_iter + 1}: {verdict['decision']} (seed {res.seed})", state="complete")
     except Exception as e:
         stop_auto(f"Generation failed: {e}"); st.rerun(); return
 
+    image_changed = (prev_hash is None) or (new_hash != prev_hash)
+    assessment_changed = not _text_similar(verdict["assessment"], st.session_state.last_assessment)
+    st.session_state.last_result_hash = new_hash
+    st.session_state.last_assessment = verdict["assessment"]
+
     record_refine_step(res.image_path, res.image_path.name, prompt, verdict, f"auto #{st.session_state.auto_iter + 1}", seed=res.seed)
-    update_after_verdict(verdict, prompt)
+    update_after_verdict(verdict, prompt, image_changed=image_changed, assessment_changed=assessment_changed)
     st.session_state.auto_iter += 1
     st.rerun()
 
