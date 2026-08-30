@@ -116,6 +116,20 @@ class InvokeAIBackend(ImageGenBackend):
                 return None
         return None
 
+    def active_loras(self):
+        """LoRAs baked into the captured graph: [{name, hash, key, weight, node_id}]."""
+        if not self._template:
+            return []
+        out = []
+        for nid, n in self._template["nodes"].items():
+            if n.get("type", "").endswith("lora_selector") or n.get("type") == "lora_selector":
+                lora = n.get("lora") or {}
+                out.append({
+                    "name": lora.get("name"), "hash": lora.get("hash"),
+                    "key": lora.get("key"), "weight": n.get("weight"), "node_id": nid,
+                })
+        return out
+
     # --- generation -------------------------------------------------------
     def generate(self, prompt, negative="", params=None, progress=None):
         params = params or {}

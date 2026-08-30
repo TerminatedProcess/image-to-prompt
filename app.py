@@ -16,6 +16,7 @@ from api_client import APIClient
 from bulk_analyzer import bulk_analysis_page
 from metadata_extractor import ImageMetadataExtractor
 import image_backends
+import lora_hub
 from refine_engine import REFINE_SYSTEM, build_user_message, parse_verdict
 
 # --- Constants from joycaption ---
@@ -189,6 +190,7 @@ def init_session_state():
     if "auto_summary" not in st.session_state: st.session_state.auto_summary = ""
     if "auto_phase" not in st.session_state: st.session_state.auto_phase = "fixed"
     if "fixed_seed" not in st.session_state: st.session_state.fixed_seed = None
+    if "inject_lora_triggers" not in st.session_state: st.session_state.inject_lora_triggers = True
 
 init_session_state()
 
@@ -636,6 +638,43 @@ def get_target_seed():
     except Exception:
         return None
 
+def active_loras_with_meta(backend):
+    """Active LoRAs enriched with hub metadata: [{name, weight, triggers, description}]."""
+    if not hasattr(backend, "active_loras"):
+        return []
+    out = []
+    for la in backend.active_loras():
+        meta = lora_hub.meta_for(la.get("hash")) or {}
+        out.append({
+            "name": la.get("name") or meta.get("name"),
+            "weight": la.get("weight"),
+            "triggers": meta.get("triggers", []),
+            "description": meta.get("description"),
+        })
+    return out
+
+def apply_lora_triggers(prompt, backend):
+    """Append active LoRAs' trigger words to the generation prompt (deterministic).
+
+    Returns (generation_prompt, added_triggers). The refine/descriptive prompt is
+    left untouched — triggers are a generation-time addition, re-applied each round.
+    """
+    if not st.session_state.get("inject_lora_triggers", True):
+        return prompt, []
+    if not hasattr(backend, "active_loras"):
+        return prompt, []
+    haystack = prompt.lower()
+    additions = []
+    for la in backend.active_loras():
+        for trig in lora_hub.triggers_for(la.get("hash")):
+            t = trig.strip()
+            tl = t.lower()
+            if t and tl not in haystack and tl not in ", ".join(additions).lower():
+                additions.append(t)
+    if additions:
+        prompt = prompt.rstrip().rstrip(",") + ", " + ", ".join(additions)
+    return prompt, additions
+
 def get_or_create_backend(backend_id):
     obj = st.session_state.refine_backend_obj
     if obj is None or getattr(obj, "id", None) != backend_id:
@@ -704,11 +743,14 @@ def run_auto_step():
     strategy = st.session_state.get("refine_seed_strategy", "fixed_then_random")
     use_seed = None if (strategy == "random" or st.session_state.auto_phase == "random") else st.session_state.fixed_seed
     phase_label = "random seed" if use_seed is None else f"fixed seed {use_seed}"
+    gen_prompt, added_trigs = apply_lora_triggers(prompt, backend)
     try:
         with st.status(f"Auto-refine iteration {st.session_state.auto_iter + 1}/{max_iters} ({phase_label})…", expanded=True) as status:
             def prog(msg):
                 status.update(label=msg)
-            res = backend.generate(prompt, params={"seed": use_seed}, progress=prog)
+            if added_trigs:
+                prog(f"Added LoRA triggers: {', '.join(added_trigs)}")
+            res = backend.generate(gen_prompt, params={"seed": use_seed}, progress=prog)
             prog("Reviewing result against the target…")
             verdict = run_vision_review(targets, prev, res.image_path, prompt)
             status.update(label=f"Iteration {st.session_state.auto_iter + 1}: {verdict['decision']} (seed {res.seed})", state="complete")
@@ -731,8 +773,9 @@ def generate_prompt_in_backend(prompt):
     backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
     try:
         backend.prepare()
+        gen_prompt, _added = apply_lora_triggers(prompt, backend)
         with st.spinner(f"Generating in {backend.display_name}…"):
-            res = backend.generate(prompt, params={"seed": None})
+            res = backend.generate(gen_prompt, params={"seed": None})
     except Exception as e:
         st.error(f"{backend.display_name} generation failed: {e}"); return False
 
@@ -823,6 +866,22 @@ def render_refine_section(current_provider):
         st.caption("Fixed seed holds the composition so only the prompt varies. Its value comes "
                    "from the target image's metadata if present, else InvokeAI's current seed. "
                    "'Fixed then randomize' explores new seeds once wording stops helping.")
+
+        st.checkbox("Inject LoRA trigger words into prompts", key="inject_lora_triggers",
+                    disabled=st.session_state.auto_running,
+                    help="Appends the active LoRAs' trigger words (from the model hub) to each "
+                         "generation prompt, so character/concept LoRAs actually fire.")
+
+        # LoRA awareness: show the LoRAs baked into the captured InvokeAI setup.
+        if backend.id == "invokeai" and getattr(backend, "_template", None) is not None:
+            loras = active_loras_with_meta(backend)
+            if loras:
+                hub_ok = lora_hub.available()
+                lines = []
+                for la in loras:
+                    trig = ", ".join(la["triggers"]) if la["triggers"] else ("—" if hub_ok else "hub offline")
+                    lines.append(f"- **{la['name']}** @ {la['weight']} · triggers: {trig}")
+                st.markdown("**Active LoRAs:**\n" + "\n".join(lines))
 
         if not st.session_state.auto_running:
             if backend.id == "invokeai":
