@@ -112,6 +112,7 @@ EXTRA_OPTIONS_KEYS = [
     "Explicitly specify the vantage height (eye-level, low-angle worm’s-eye, bird’s-eye, drone, rooftop, etc.).",
     "If there is a watermark, you must mention it.",
     'Your response will be used by a text-to-image model, so avoid useless meta phrases like \“This image shows…\", \“You are looking at...\", etc.',
+    "Always state the subject's hair color, length, and style, plus eye color and skin tone.",
 ]
 
 def _current_builder_config():
