@@ -19,7 +19,7 @@ from metadata_extractor import ImageMetadataExtractor
 import image_backends
 import lora_hub
 import ipush_bridge
-from refine_engine import REFINE_SYSTEM, build_user_message, parse_verdict
+from refine_engine import REFINE_SYSTEM, TWEAK_SYSTEM, build_user_message, parse_verdict, parse_tweak
 
 # --- Constants from joycaption ---
 CAPTION_TYPE_MAP = {
@@ -153,6 +153,32 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# --- Workspace persistence (auto-save / restore across browser restarts) ---
+_WORKSPACE_KEYS = (
+    "pv_before", "pv_prompt", "pv_runs", "pv_counter", "pv_tweak_messages",
+    "refine_backend", "refine_max_iters", "refine_plateau_n", "refine_seed_strategy",
+    "img2img_ref", "img2img_strength", "mirror_tolerant", "inject_lora_triggers",
+    "gen_build_mode", "build_loras", "build_width", "build_height", "build_steps", "build_cfg",
+)
+
+def _restore_workspace_state():
+    data = cm.load_workspace_state()
+    if not data:
+        return
+    for k in _WORKSPACE_KEYS:
+        if k in data:
+            st.session_state[k] = data[k]
+    if "uploaded_files" in data:
+        st.session_state.uploaded_files = [(p, n) for p, n in data["uploaded_files"]]
+
+def _save_workspace_state():
+    try:
+        data = {k: st.session_state.get(k) for k in _WORKSPACE_KEYS}
+        data["uploaded_files"] = [[str(p), n] for (p, n) in st.session_state.get("uploaded_files", [])]
+        cm.save_workspace_state(data)
+    except Exception:
+        pass
+
 # --- Initialize Session State ---
 def init_session_state():
     if "messages" not in st.session_state: st.session_state.messages = []
@@ -206,6 +232,23 @@ def init_session_state():
     if "pv_view" not in st.session_state: st.session_state.pv_view = None
     if "pv_counter" not in st.session_state: st.session_state.pv_counter = 0
     if "pv_result_uploader_key" not in st.session_state: st.session_state.pv_result_uploader_key = str(uuid.uuid4())
+    if "pv_tweak_messages" not in st.session_state: st.session_state.pv_tweak_messages = []
+    if "pv_tweak_open" not in st.session_state: st.session_state.pv_tweak_open = False
+    if "pv_tweak_input_key" not in st.session_state: st.session_state.pv_tweak_input_key = str(uuid.uuid4())
+    # Workspace settings (init here so they can be restored before their widgets render)
+    if "refine_backend" not in st.session_state: st.session_state.refine_backend = "invokeai"
+    if "refine_max_iters" not in st.session_state: st.session_state.refine_max_iters = 5
+    if "refine_plateau_n" not in st.session_state: st.session_state.refine_plateau_n = 2
+    if "refine_seed_strategy" not in st.session_state: st.session_state.refine_seed_strategy = "fixed_then_random"
+    if "img2img_strength" not in st.session_state: st.session_state.img2img_strength = 0.6
+    if "build_width" not in st.session_state: st.session_state.build_width = 992
+    if "build_height" not in st.session_state: st.session_state.build_height = 1488
+    if "build_steps" not in st.session_state: st.session_state.build_steps = 8
+    if "build_cfg" not in st.session_state: st.session_state.build_cfg = 1.0
+    # Restore the persisted workspace once per session
+    if "pv_restored" not in st.session_state:
+        st.session_state.pv_restored = True
+        _restore_workspace_state()
 
 init_session_state()
 
@@ -901,10 +944,10 @@ def render_build_controls(backend):
         return
     st.caption(f"Model (live from InvokeAI): **{mref.get('name')}** ({mref.get('base')})")
     d1, d2, d3, d4 = st.columns(4)
-    d1.number_input("Width", 256, 2048, value=992, step=16, key="build_width", disabled=st.session_state.auto_running)
-    d2.number_input("Height", 256, 2048, value=1488, step=16, key="build_height", disabled=st.session_state.auto_running)
-    d3.number_input("Steps", 1, 60, value=8, key="build_steps", disabled=st.session_state.auto_running)
-    d4.number_input("CFG", 0.0, 20.0, value=1.0, step=0.5, key="build_cfg", disabled=st.session_state.auto_running)
+    d1.number_input("Width", 256, 2048, step=16, key="build_width", disabled=st.session_state.auto_running)
+    d2.number_input("Height", 256, 2048, step=16, key="build_height", disabled=st.session_state.auto_running)
+    d3.number_input("Steps", 1, 60, key="build_steps", disabled=st.session_state.auto_running)
+    d4.number_input("CFG", 0.0, 20.0, step=0.5, key="build_cfg", disabled=st.session_state.auto_running)
 
     if st.session_state.build_loras:
         st.caption("**LoRAs to load** (loading applies the effect; tick *trigger* only if you want "
@@ -1997,8 +2040,8 @@ def render_auto_controls():
         render_build_controls(backend)
 
         c1, c2 = st.columns(2)
-        c1.number_input("Max iterations", 1, 25, value=5, key="refine_max_iters", disabled=st.session_state.auto_running)
-        c2.number_input("Stop after N non-improving rounds", 1, 10, value=2, key="refine_plateau_n", disabled=st.session_state.auto_running)
+        c1.number_input("Max iterations", 1, 25, key="refine_max_iters", disabled=st.session_state.auto_running)
+        c2.number_input("Stop after N non-improving rounds", 1, 10, key="refine_plateau_n", disabled=st.session_state.auto_running)
         seed_labels = {"fixed_then_random": "Fixed, then randomize on plateau (recommended)",
                        "fixed": "Fixed seed only", "random": "Random seed each cycle"}
         st.selectbox("Seed strategy", options=list(seed_labels.keys()), format_func=lambda k: seed_labels[k],
@@ -2008,7 +2051,7 @@ def render_auto_controls():
                         disabled=st.session_state.auto_running,
                         help="Use the reference image as the init so pose/orientation/framing are inherited.")
             if st.session_state.get("img2img_ref"):
-                st.slider("Restyle strength", 0.2, 0.95, value=0.6, step=0.05, key="img2img_strength",
+                st.slider("Restyle strength", 0.2, 0.95, step=0.05, key="img2img_strength",
                           disabled=st.session_state.auto_running)
         st.checkbox("Ignore left/right flips (mirror-tolerant)", key="mirror_tolerant", disabled=st.session_state.auto_running)
 
@@ -2027,12 +2070,68 @@ def render_auto_controls():
         if st.session_state.auto_summary:
             st.info(st.session_state.auto_summary)
 
+def run_tweak(instruction):
+    ref = pv_before_path()
+    model = pv_first_model()
+    if not model:
+        st.warning("Select a vision model in the sidebar."); return
+    st.session_state.pv_tweak_messages.append({"role": "user", "content": instruction})
+    convo = [{"role": "system", "content": TWEAK_SYSTEM},
+             {"role": "user", "content": f"Current prompt:\n{st.session_state.pv_prompt or '(none yet)'}"}]
+    for m in st.session_state.pv_tweak_messages:
+        convo.append({"role": m["role"], "content": m["content"]})
+    client = make_api_client()
+    images = [ref] if ref else []
+    full = ""
+    with st.spinner("Thinking…"):
+        for chunk in client.generate_chat_response(model=model, messages=convo, images=images, videos=[]):
+            full += chunk
+    reply, new_prompt = parse_tweak(remove_thinking_tags(full))
+    st.session_state.pv_tweak_messages.append({"role": "assistant", "content": reply})
+    if new_prompt:
+        st.session_state.pv_prompt_pending = new_prompt
+
+@st.dialog("🛠 AI Tweak")
+def ai_tweak_dialog():
+    ref = pv_before_path()
+    tc = st.columns([1, 3])
+    with tc[0]:
+        if ref:
+            st.image(str(ref), use_container_width=True)
+    with tc[1]:
+        st.caption("Chat to refine the prompt — it sees the reference image and the current prompt. "
+                   "Ask it to add a detail, fix something it missed, change specifics, etc.")
+    with st.container(height=280):
+        if not st.session_state.pv_tweak_messages:
+            st.caption("No messages yet. Try: “She's wearing sandals, not heels” or “emphasise the golden-hour light”.")
+        for m in st.session_state.pv_tweak_messages:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+    with st.expander("Current prompt", expanded=False):
+        st.code(st.session_state.pv_prompt or "(empty)", language=None)
+
+    instr = st.text_input("Ask for a change…", key=st.session_state.pv_tweak_input_key,
+                          placeholder="e.g. make her hair straighter and add a window on the left")
+    b1, b2, b3 = st.columns(3)
+    if b1.button("Send", type="primary", use_container_width=True, disabled=not instr.strip()):
+        run_tweak(instr.strip())
+        st.session_state.pv_tweak_input_key = str(uuid.uuid4())  # fresh (empty) input next run
+        st.rerun()
+    if b2.button("🎨 Generate", use_container_width=True, disabled=not st.session_state.pv_prompt.strip()):
+        if pv_generate("tweak"):
+            st.rerun()
+    if b3.button("Close", use_container_width=True):
+        st.session_state.pv_tweak_open = False
+        st.rerun()
+
 def render_workspace():
     # Apply any prompt update queued from a post-widget handler (analyze / auto /
-    # drop) BEFORE the text_area is instantiated — Streamlit forbids modifying a
-    # widget-keyed value after the widget exists.
+    # drop / tweak) BEFORE the text_area is instantiated — Streamlit forbids
+    # modifying a widget-keyed value after the widget exists.
     if "pv_prompt_pending" in st.session_state:
         st.session_state.pv_prompt = st.session_state.pop("pv_prompt_pending")
+    if st.session_state.pv_tweak_open:
+        ai_tweak_dialog()
 
     st.markdown("""
     <style>
@@ -2136,24 +2235,26 @@ def render_workspace():
             st.text_area("Prompt", key="pv_prompt", height=200,
                          disabled=st.session_state.auto_running,
                          placeholder="Analyze the starting image, or type a prompt…")
-            b1, b2, _b3 = st.columns([1, 1, 2])
+            b1, b2, b3, _b4 = st.columns([1, 1, 1, 1])
             if b1.button("🔍 Analyze", use_container_width=True, disabled=st.session_state.auto_running):
                 pv_analyze(); st.rerun()
-            if b2.button("🎨 Generate", type="primary", use_container_width=True, disabled=st.session_state.auto_running):
+            if b2.button("🛠 AI Tweak", use_container_width=True, disabled=st.session_state.auto_running):
+                st.session_state.pv_tweak_open = True; st.rerun()
+            if b3.button("🎨 Generate", type="primary", use_container_width=True, disabled=st.session_state.auto_running):
                 if pv_generate("generate"):
                     st.rerun()
 
-            # results strip (newest first)
+            # results strip (newest first) — small thumbnails, hover to expand
             if st.session_state.pv_runs:
                 st.caption("Results")
-                recent = list(reversed(st.session_state.pv_runs))[:6]
-                rcols = st.columns(len(recent))
+                recent = list(reversed(st.session_state.pv_runs))[:10]
+                rcols = st.columns(10)
                 for i, r in enumerate(recent):
-                    with rcols[i]:
+                    with rcols[i % 10]:
                         if Path(r["after"]).exists():
                             st.image(r["after"], use_container_width=True)
                         st.caption(f"#{r['n']}")
-                        if st.button("⤴ ref", key=f"pv_setref_{r['id']}", use_container_width=True,
+                        if st.button("⤴", key=f"pv_setref_{r['id']}", use_container_width=True,
                                      help="Use this result as the reference", disabled=st.session_state.auto_running):
                             st.session_state.pv_before = r["after"]; st.rerun()
 
@@ -2195,6 +2296,8 @@ def render_workspace():
                         st.caption((r["prompt"] or "")[:110] + ("…" if len(r["prompt"] or "") > 110 else ""))
                         if st.button("view", key=f"pv_view_{r['id']}", use_container_width=True):
                             st.session_state.pv_view = r["id"]; st.rerun()
+
+    _save_workspace_state()
 
     if st.session_state.auto_running:
         pv_auto_step()

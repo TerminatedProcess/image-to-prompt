@@ -7,3 +7,4 @@ temp_images
 data/conversations
 temp_videos
 .claude/
+data/workspace_state.json

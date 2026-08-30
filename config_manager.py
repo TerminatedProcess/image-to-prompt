@@ -8,6 +8,7 @@ DATA_DIR = Path("data")
 CONFIG_PATH = DATA_DIR / "config.json"
 PROMPTS_PATH = DATA_DIR / "system_prompts.json"
 BUILDER_CONFIGS_PATH = DATA_DIR / "builder_configs.json"
+WORKSPACE_PATH = DATA_DIR / "workspace_state.json"
 CONVERSATIONS_DIR = DATA_DIR / "conversations"
 
 # --- Predefined System Prompts ---
@@ -200,6 +201,28 @@ def save_builder_configs(configs):
     ensure_data_dirs()
     with open(BUILDER_CONFIGS_PATH, 'w') as f:
         json.dump(configs, f, indent=2)
+
+def load_workspace_state():
+    """Load the persisted two-panel workspace state (runs, prompt, settings)."""
+    ensure_data_dirs()
+    if WORKSPACE_PATH.exists():
+        try:
+            with open(WORKSPACE_PATH, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_workspace_state(state):
+    """Persist the workspace state so it survives a browser close / restart."""
+    ensure_data_dirs()
+    try:
+        with open(WORKSPACE_PATH, 'w') as f:
+            json.dump(state, f, indent=2)
+    except OSError:
+        pass
+
 
 def save_conversation(conversation_history, filename):
     """Saves a conversation to a file."""

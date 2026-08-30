@@ -81,6 +81,28 @@ def build_user_message(current_prompt, history, n_targets=1, has_prev=False, mir
     )
 
 
+TWEAK_SYSTEM = (
+    "You are helping refine a text-to-image PROMPT so its output matches the reference image "
+    "(shown). The user will chat with you to adjust the prompt — add details, fix things the "
+    "caption missed, change specifics, emphasise something, etc.\n\n"
+    "Each turn: reply briefly and conversationally about what you changed or observed, then on a "
+    "new line output the COMPLETE updated prompt after a line beginning with 'PROMPT:'. Always "
+    "include the FULL prompt (not just the change), as one block, ready for a text-to-image model. "
+    "If the user only asks a question and no prompt change is warranted, you may answer without a "
+    "PROMPT: line."
+)
+
+
+def parse_tweak(text):
+    """Split a tweak reply into (chat_reply, new_prompt_or_None)."""
+    raw = text or ""
+    m = re.search(r"(.*?)(?:^|\n)\s*PROMPT:\s*(.+)$", raw, re.S | re.I)
+    if m:
+        reply = m.group(1).strip() or "(updated the prompt)"
+        return reply, m.group(2).strip()
+    return raw.strip(), None
+
+
 def parse_verdict(text, fallback_prompt=""):
     """Forgiving parse. Returns {decision, prompt, assessment, raw}."""
     raw = text or ""
