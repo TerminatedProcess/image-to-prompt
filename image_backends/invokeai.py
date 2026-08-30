@@ -34,11 +34,64 @@ class InvokeAIBackend(ImageGenBackend):
         self._base_type = None
         self._setup_desc = ""
         self.build_config = None      # set by the app for build-from-scratch mode
+        self.img2img_config = None    # {init_path, strength} to lock composition to a reference
         self._last_unresolved = []
+        self._init_uploads = {}
+
+    # InvokeAI image-to-latents node type per model base (for img2img).
+    I2L_BY_BASE = {
+        "sdxl": "i2l", "sdxl-refiner": "i2l", "sd-1": "i2l", "sd-2": "i2l",
+        "krea-2": "qwen_image_i2l", "qwen-image": "qwen_image_i2l",
+        "anima": "anima_i2l", "z-image": "z_image_i2l",
+    }
 
     def set_build_config(self, cfg):
         """cfg = {model_ref, loras:[{name,weight,ref}], width, height, steps, cfg} or None."""
         self.build_config = cfg
+
+    def set_img2img(self, cfg):
+        """cfg = {init_path, strength} — use an image as the composition reference, or None."""
+        self.img2img_config = cfg
+
+    def _upload_init(self, path):
+        """Upload an init image to InvokeAI once; cache the returned image_name."""
+        key = str(path)
+        if key in self._init_uploads:
+            return self._init_uploads[key]
+        with open(path, "rb") as f:
+            r = requests.post(
+                f"{self.base_url}/api/v1/images/upload",
+                params={"image_category": "user", "is_intermediate": "false"},
+                files={"file": (Path(path).name, f, "image/png")}, timeout=30,
+            )
+        r.raise_for_status()
+        name = r.json()["image_name"]
+        self._init_uploads[key] = name
+        return name
+
+    def _apply_img2img(self, graph, base, strength, init_path):
+        """Rewrite a txt2img graph into img2img: encode init image → denoise.latents,
+        and set denoising_start so `strength` controls how much is restyled."""
+        i2l_type = self.I2L_BY_BASE.get(base)
+        if not i2l_type:
+            raise RuntimeError(f"img2img isn't supported for base '{base}' yet.")
+        nodes, edges = graph["nodes"], graph["edges"]
+        den = next((nid for nid, n in nodes.items() if "denoise" in (n.get("type") or "")), None)
+        if not den:
+            raise RuntimeError("No denoise node found for img2img.")
+        vae_src = next(((e["source"]["node_id"], e["source"]["field"])
+                        for e in edges if e["destination"]["field"] == "vae"), None)
+        if not vae_src:
+            raise RuntimeError("No VAE source found in graph for img2img.")
+        image_name = self._upload_init(init_path)
+        i2l = "i2l_" + uuid.uuid4().hex[:8]
+        nodes[i2l] = {"id": i2l, "type": i2l_type, "is_intermediate": True,
+                      "use_cache": True, "image": {"image_name": image_name}}
+        edges.append({"source": {"node_id": vae_src[0], "field": vae_src[1]},
+                      "destination": {"node_id": i2l, "field": "vae"}})
+        edges.append({"source": {"node_id": i2l, "field": "latents"},
+                      "destination": {"node_id": den, "field": "latents"}})
+        nodes[den]["denoising_start"] = round(max(0.0, min(1.0, 1.0 - float(strength))), 3)
 
     # --- reachability -----------------------------------------------------
     def status(self) -> BackendStatus:
@@ -130,7 +183,8 @@ class InvokeAIBackend(ImageGenBackend):
             for l in self.build_config.get("loras", []):
                 ref = l.get("ref") or {}
                 out.append({"name": l.get("name") or ref.get("name"), "hash": ref.get("hash"),
-                            "key": ref.get("key"), "weight": l.get("weight")})
+                            "key": ref.get("key"), "weight": l.get("weight"),
+                            "inject": bool(l.get("inject"))})
             return out
         if not self._template:
             return []
@@ -242,6 +296,13 @@ class InvokeAIBackend(ImageGenBackend):
                 loras=[(l["name"], l["weight"], l.get("ref")) for l in bc.get("loras", [])],
             )
             self._last_unresolved = unresolved
+            base = (bc.get("model_ref") or {}).get("base")
         else:
             graph, seed = self._build_capture_graph(prompt, negative, params)
+            base = self._base_type
+        if self.img2img_config and self.img2img_config.get("init_path"):
+            if progress:
+                progress("Applying img2img reference…")
+            self._apply_img2img(graph, base, self.img2img_config.get("strength", 0.6),
+                                self.img2img_config["init_path"])
         return self.enqueue_and_wait(graph, seed, params.get("timeout", 300), progress)

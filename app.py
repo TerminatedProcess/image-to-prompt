@@ -192,7 +192,9 @@ def init_session_state():
     if "auto_summary" not in st.session_state: st.session_state.auto_summary = ""
     if "auto_phase" not in st.session_state: st.session_state.auto_phase = "fixed"
     if "fixed_seed" not in st.session_state: st.session_state.fixed_seed = None
-    if "inject_lora_triggers" not in st.session_state: st.session_state.inject_lora_triggers = True
+    if "inject_lora_triggers" not in st.session_state: st.session_state.inject_lora_triggers = False
+    if "mirror_tolerant" not in st.session_state: st.session_state.mirror_tolerant = False
+    if "img2img_ref" not in st.session_state: st.session_state.img2img_ref = False
     if "gen_build_mode" not in st.session_state: st.session_state.gen_build_mode = False
     if "build_loras" not in st.session_state: st.session_state.build_loras = []
     if "last_result_hash" not in st.session_state: st.session_state.last_result_hash = None
@@ -559,7 +561,9 @@ def run_vision_review(target_paths, prev_path, new_path, current_prompt):
     if prev_path:
         images.append(Path(prev_path))
     images.append(Path(new_path))
-    user_msg = build_user_message(current_prompt, refine_history(), n_targets=len(target_paths), has_prev=bool(prev_path))
+    user_msg = build_user_message(current_prompt, refine_history(), n_targets=len(target_paths),
+                                  has_prev=bool(prev_path),
+                                  mirror_tolerant=st.session_state.get("mirror_tolerant", False))
     api_messages = [{"role": "system", "content": REFINE_SYSTEM}, {"role": "user", "content": user_msg}]
     client = make_api_client()
     full = ""
@@ -686,13 +690,19 @@ def apply_lora_triggers(prompt, backend):
     Returns (generation_prompt, added_triggers). The refine/descriptive prompt is
     left untouched — triggers are a generation-time addition, re-applied each round.
     """
-    if not st.session_state.get("inject_lora_triggers", True):
-        return prompt, []
     if not hasattr(backend, "active_loras"):
         return prompt, []
+    global_on = st.session_state.get("inject_lora_triggers", False)
     haystack = prompt.lower()
     additions = []
     for la in backend.active_loras():
+        # Per-LoRA opt-in when present (build mode), else the global toggle. Only
+        # inject a LoRA's trigger when you actually want its concept — a loaded
+        # style LoRA works without one, and forcing an off-topic trigger (e.g. an
+        # "Aeroflot uniform" LoRA on a couch scene) corrupts the image.
+        want = la.get("inject") if la.get("inject") is not None else global_on
+        if not want:
+            continue
         for trig in lora_hub.triggers_for(la.get("hash")):
             t = trig.strip()
             tl = t.lower()
@@ -717,6 +727,13 @@ def configure_backend_generation(backend):
         })
     else:
         backend.set_build_config(None)
+    if hasattr(backend, "set_img2img"):
+        targets = get_starting_image_paths()
+        if st.session_state.get("img2img_ref") and targets:
+            backend.set_img2img({"init_path": str(targets[0]),
+                                 "strength": float(st.session_state.get("img2img_strength", 0.6))})
+        else:
+            backend.set_img2img(None)
 
 def get_or_create_backend(backend_id):
     obj = st.session_state.refine_backend_obj
@@ -881,14 +898,17 @@ def render_build_controls(backend):
     d4.number_input("CFG", 0.0, 20.0, value=1.0, step=0.5, key="build_cfg", disabled=st.session_state.auto_running)
 
     if st.session_state.build_loras:
-        st.caption("**LoRAs to load:**")
+        st.caption("**LoRAs to load** (loading applies the effect; tick *trigger* only if you want "
+                   "that LoRA's concept forced into the prompt):")
         for i, l in enumerate(list(st.session_state.build_loras)):
-            lc = st.columns([4, 2, 1])
+            lc = st.columns([4, 2, 2, 1])
             lc[0].caption(l["name"])
             l["weight"] = lc[1].number_input(
                 "weight", 0.0, 2.0, value=float(l["weight"]), step=0.05,
                 key=f"blw_{i}", label_visibility="collapsed", disabled=st.session_state.auto_running)
-            if lc[2].button("×", key=f"brm_{i}", disabled=st.session_state.auto_running):
+            l["inject"] = lc[2].checkbox("trigger", value=bool(l.get("inject")),
+                                         key=f"bli_{i}", disabled=st.session_state.auto_running)
+            if lc[3].button("×", key=f"brm_{i}", disabled=st.session_state.auto_running):
                 st.session_state.build_loras.pop(i); st.rerun()
 
     if not st.session_state.auto_running:
@@ -911,7 +931,7 @@ def render_build_controls(backend):
                     elif ref.get("base") != base:
                         st.warning(f"'{name}' is base {ref.get('base')}, not {base} — incompatible with this model.")
                     else:
-                        st.session_state.build_loras.append({"name": name, "weight": 0.75, "ref": ref})
+                        st.session_state.build_loras.append({"name": name, "weight": 0.75, "ref": ref, "inject": False})
                         st.rerun()
 
 def render_refine_section(current_provider):
@@ -995,10 +1015,27 @@ def render_refine_section(current_provider):
                    "from the target image's metadata if present, else InvokeAI's current seed. "
                    "'Fixed then randomize' explores new seeds once wording stops helping.")
 
-        st.checkbox("Inject LoRA trigger words into prompts", key="inject_lora_triggers",
+        st.checkbox("Inject ALL LoRA trigger words (capture mode)", key="inject_lora_triggers",
                     disabled=st.session_state.auto_running,
-                    help="Appends the active LoRAs' trigger words (from the model hub) to each "
-                         "generation prompt, so character/concept LoRAs actually fire.")
+                    help="Capture mode only, off by default: appends every active LoRA's trigger to "
+                         "the prompt. Usually leave OFF — loading a LoRA already applies it, and "
+                         "forcing an off-topic trigger corrupts the image. In Build mode, use the "
+                         "per-LoRA 'trigger' checkbox instead.")
+        st.checkbox("Ignore left/right flips (mirror-tolerant comparison)", key="mirror_tolerant",
+                    disabled=st.session_state.auto_running,
+                    help="Tells the reviewer to treat a horizontally mirrored layout as a match, so "
+                         "it stops penalizing left/right flips the model can't reliably control.")
+        if backend.id == "invokeai":
+            st.checkbox("Lock composition to the Starting Image (img2img reference)", key="img2img_ref",
+                        disabled=st.session_state.auto_running,
+                        help="Uses the target as the init image so pose, orientation and framing are "
+                             "inherited from it (the reliable fix for left/right and pose) — the model "
+                             "and prompt only restyle it. Krea-2 has no ControlNet, so this is the way.")
+            if st.session_state.get("img2img_ref"):
+                st.slider("Restyle strength", 0.2, 0.95, value=0.6, step=0.05, key="img2img_strength",
+                          disabled=st.session_state.auto_running,
+                          help="Higher = more freedom to restyle (less of the original); lower = stick "
+                               "closer to the target's exact composition and colors.")
 
         # LoRA awareness: show the LoRAs baked into the captured InvokeAI setup.
         if backend.id == "invokeai" and getattr(backend, "_template", None) is not None:

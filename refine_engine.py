@@ -61,17 +61,22 @@ def format_history(history, limit=4):
     return "\n".join(lines)
 
 
-def build_user_message(current_prompt, history, n_targets=1, has_prev=False):
+def build_user_message(current_prompt, history, n_targets=1, has_prev=False, mirror_tolerant=False):
     order = f"The first {n_targets} image(s) are the TARGET"
     if has_prev:
         order += ", the next-to-last image is the PREVIOUS attempt, and the last image is the NEWEST attempt."
     else:
         order += ", and the last image is the NEWEST attempt."
     base = current_prompt.strip() if current_prompt else "(none yet — infer a prompt that would produce the TARGET)"
+    mirror = ("\n\nNOTE: Ignore horizontal (left/right) mirroring. A mirrored layout counts as a "
+              "MATCH — do NOT report left/right position or facing-direction differences as errors; "
+              "judge only content, pose, elements, and framing regardless of which side they are on."
+              if mirror_tolerant else "")
     return (
         f"{order}\n\n"
         f"CURRENT best prompt (this produced the newest attempt):\n{base}\n\n"
-        f"History of attempts (oldest → newest):\n{format_history(history)}\n\n"
+        f"History of attempts (oldest → newest):\n{format_history(history)}"
+        f"{mirror}\n\n"
         "Assess the newest attempt against the target and respond in the required format."
     )
 
