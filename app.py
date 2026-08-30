@@ -2032,8 +2032,38 @@ def render_workspace():
     <style>
       .pv-num{font-weight:700;opacity:.7}
       div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:14px}
+      [data-testid="stImage"] img{cursor:zoom-in;}
     </style>
     """, unsafe_allow_html=True)
+
+    # Hover-to-zoom lightbox: hover any image ~1s → centered full-size overlay.
+    components.html("""
+    <script>
+    (function(){
+      const doc = window.parent.document;
+      if (doc.__pvLightbox) return;
+      doc.__pvLightbox = true;
+      const ov = doc.createElement('div');
+      ov.style.cssText = 'position:fixed;inset:0;z-index:100000;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,0.78);pointer-events:none;';
+      const im = doc.createElement('img');
+      im.style.cssText = 'width:64vw;height:63vh;object-fit:contain;';
+      ov.appendChild(im); doc.body.appendChild(ov);
+      let timer = null;
+      const hide = () => { ov.style.display='none'; if(timer){clearTimeout(timer);timer=null;} };
+      doc.addEventListener('mouseover', function(e){
+        const img = e.target.closest && e.target.closest('[data-testid="stImage"] img');
+        if(!img) return;
+        if(timer) clearTimeout(timer);
+        const src = img.currentSrc || img.src;
+        timer = setTimeout(function(){ im.src = src; ov.style.display='flex'; }, 1000);
+      }, true);
+      doc.addEventListener('mouseout', function(e){
+        const img = e.target.closest && e.target.closest('[data-testid="stImage"] img');
+        if(img) hide();
+      }, true);
+    })();
+    </script>
+    """, height=0)
 
     # ---- Starting images (targets) ----
     with st.container(border=True):
@@ -2042,12 +2072,18 @@ def render_workspace():
                               accept_multiple_files=True, key=st.session_state.uploader_key,
                               label_visibility="collapsed")
         if up:
-            st.session_state.uploaded_files = [save_uploaded_file(f) for f in up]
+            sig = tuple((f.name, f.size) for f in up)
+            if sig != st.session_state.get("pv_start_sig"):
+                st.session_state.pv_start_sig = sig
+                st.session_state.uploaded_files = [save_uploaded_file(f) for f in up]
+                st.session_state.pv_before = None  # new target becomes the reference
         starts = get_starting_image_paths()
         if starts:
-            cols = st.columns(min(6, len(starts)))
+            # Narrow columns keep them thumbnail-sized on screen, but use_container_width
+            # serves full-resolution (an int width= would resize the bytes → blurry zoom).
+            tcols = st.columns(10)
             for i, p in enumerate(starts):
-                with cols[i % len(cols)]:
+                with tcols[i % 10]:
                     st.image(str(p), use_container_width=True)
         else:
             st.caption("Drop a target image to begin.")
@@ -2091,30 +2127,15 @@ def render_workspace():
                           help="Clear the prompt, results and history — keeps the starting image(s)."):
                 pv_clear(); st.rerun()
 
-            rcol, pcol = st.columns([1, 2])
-            with rcol:
-                ref = pv_before_path()
-                st.caption("Reference (before)")
-                if ref:
-                    st.image(str(ref), use_container_width=True)
-                rup = st.file_uploader("Replace reference", type=["png", "jpg", "jpeg", "webp"],
-                                       accept_multiple_files=False, key="pv_ref_uploader",
-                                       label_visibility="collapsed", disabled=st.session_state.auto_running)
-                if rup is not None:
-                    p, _n = save_uploaded_file(rup)
-                    st.session_state.pv_before = str(p); st.rerun()
-            with pcol:
-                st.text_area("Prompt", key="pv_prompt", height=200,
-                             disabled=st.session_state.auto_running,
-                             placeholder="Analyze the reference, or type a prompt…")
-                b1, b2, b3 = st.columns(3)
-                if b1.button("🔍 Analyze", use_container_width=True, disabled=st.session_state.auto_running):
-                    pv_analyze(); st.rerun()
-                if b2.button("🎨 Generate", type="primary", use_container_width=True, disabled=st.session_state.auto_running):
-                    if pv_generate("generate"):
-                        st.rerun()
-                if st.session_state.pv_prompt.strip():
-                    b3.button("📋 copy", use_container_width=True, disabled=True)
+            st.text_area("Prompt", key="pv_prompt", height=200,
+                         disabled=st.session_state.auto_running,
+                         placeholder="Analyze the starting image, or type a prompt…")
+            b1, b2, _b3 = st.columns([1, 1, 2])
+            if b1.button("🔍 Analyze", use_container_width=True, disabled=st.session_state.auto_running):
+                pv_analyze(); st.rerun()
+            if b2.button("🎨 Generate", type="primary", use_container_width=True, disabled=st.session_state.auto_running):
+                if pv_generate("generate"):
+                    st.rerun()
 
             # results strip (newest first)
             if st.session_state.pv_runs:
