@@ -1,5 +1,6 @@
 # app.py
 import streamlit as st
+import streamlit.components.v1 as components
 import os
 import json
 import uuid
@@ -381,6 +382,43 @@ def remove_uploaded_video(idx):
     if 0 <= idx < len(st.session_state.uploaded_videos):
         del st.session_state.uploaded_videos[idx]
         st.rerun()
+
+def copy_button(text, key):
+    """Render a small copy-to-clipboard icon button (works via browser clipboard, localhost is a secure context)."""
+    payload = json.dumps(text or "")
+    components.html(f"""
+    <div style="display:flex;justify-content:center;">
+      <button id="cb_{key}" title="Copy to clipboard"
+        style="background:transparent;border:none;cursor:pointer;padding:4px;color:#888;display:flex;align-items:center;">
+        <svg id="ic_{key}" width="18" height="18" viewBox="0 0 24 24" fill="none"
+          stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+        </svg>
+      </button>
+    </div>
+    <script>
+      const btn_{key} = document.getElementById("cb_{key}");
+      btn_{key}.addEventListener("click", async () => {{
+        try {{
+          await navigator.clipboard.writeText({payload});
+        }} catch (e) {{
+          const ta = document.createElement("textarea");
+          ta.value = {payload}; document.body.appendChild(ta); ta.select();
+          document.execCommand("copy"); ta.remove();
+        }}
+        const ic = document.getElementById("ic_{key}");
+        ic.innerHTML = '<polyline points="20 6 9 17 4 12"></polyline>';
+        btn_{key}.style.color = "#2ecc71";
+        setTimeout(() => {{
+          ic.innerHTML = '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>'
+            + '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>';
+          btn_{key}.style.color = "#888";
+        }}, 1200);
+      }});
+    </script>
+    """, height=32)
+
 
 def remove_message(idx):
     if 0 <= idx < len(st.session_state.messages):
@@ -1036,7 +1074,7 @@ with tab1:
         container = st.container()
         message_containers.append(container)
         with container:
-            col_msg, col_btn, col_regen = st.columns([8, 1, 1])
+            col_msg, col_copy, col_btn, col_regen = st.columns([8, 1, 1, 1])
             with col_msg:
                 if "display_content" in message:
                     st.markdown(message["display_content"])
@@ -1064,6 +1102,9 @@ with tab1:
                                 st.video(str(video_path))
                                 st.markdown('</div>', unsafe_allow_html=True)
                                 st.caption(video_info["name"])
+            with col_copy:
+                if message.get('role') == 'assistant':
+                    copy_button(message.get("content") or message.get("display_content", ""), key=f"copy_msg_{idx}")
             with col_btn:
                 if st.button("×", key=f"remove_msg_{idx}", help="Delete this message"):
                     remove_message(idx)
