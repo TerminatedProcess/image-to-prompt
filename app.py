@@ -186,6 +186,8 @@ def init_session_state():
     if "auto_stop" not in st.session_state: st.session_state.auto_stop = False
     if "plateau_count" not in st.session_state: st.session_state.plateau_count = 0
     if "auto_summary" not in st.session_state: st.session_state.auto_summary = ""
+    if "auto_phase" not in st.session_state: st.session_state.auto_phase = "fixed"
+    if "fixed_seed" not in st.session_state: st.session_state.fixed_seed = None
 
 init_session_state()
 
@@ -359,6 +361,8 @@ def reset_refine_state():
     st.session_state.auto_stop = False
     st.session_state.plateau_count = 0
     st.session_state.auto_summary = ""
+    st.session_state.auto_phase = "fixed"
+    st.session_state.fixed_seed = None
 
 def start_new_chat():
     st.session_state.messages = []; st.session_state.chat_id = None; st.session_state.uploaded_files = []
@@ -548,7 +552,7 @@ def run_vision_review(target_paths, prev_path, new_path, current_prompt):
         full += chunk
     return parse_verdict(remove_thinking_tags(full), fallback_prompt=current_prompt)
 
-def record_refine_step(new_path, new_name, used_prompt, verdict, source):
+def record_refine_step(new_path, new_name, used_prompt, verdict, source, seed=None):
     targets = get_starting_image_paths()
     prev = last_result_path()
     imgs = [{"path": str(p), "name": p.name} for p in targets]
@@ -570,6 +574,7 @@ def record_refine_step(new_path, new_name, used_prompt, verdict, source):
         "refine_data": {
             "result_path": str(new_path), "result_name": new_name, "used_prompt": used_prompt,
             "next_prompt": verdict["prompt"], "decision": verdict["decision"], "assessment": verdict["assessment"],
+            "seed": seed,
         },
     })
     auto_save_chat()
@@ -596,6 +601,36 @@ def do_refine_from_result(new_path, new_name, source):
     record_refine_step(new_path, new_name, prompt, verdict, source)
     update_after_verdict(verdict, prompt)
 
+def _search_seed(obj):
+    """Recursively hunt a seed value in an extracted-metadata structure."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(k, str) and k.lower() in ("seed", "noise_seed") and isinstance(v, (int, str)):
+                try:
+                    return int(str(v).strip())
+                except ValueError:
+                    pass
+            found = _search_seed(v)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _search_seed(item)
+            if found is not None:
+                return found
+    return None
+
+def get_target_seed():
+    """Seed embedded in the first starting image's metadata, or None."""
+    targets = get_starting_image_paths()
+    if not targets:
+        return None
+    try:
+        md = st.session_state.metadata_extractor.extract_metadata(str(targets[0]))
+        return _search_seed(md)
+    except Exception:
+        return None
+
 def get_or_create_backend(backend_id):
     obj = st.session_state.refine_backend_obj
     if obj is None or getattr(obj, "id", None) != backend_id:
@@ -608,12 +643,26 @@ def stop_auto(summary):
     st.session_state.auto_summary = summary
 
 def start_auto_loop():
+    import random
     backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
     try:
         backend.prepare()
     except Exception as e:
         st.session_state.auto_summary = f"Could not start: {e}"
         return
+    # Fixed-seed source priority: target metadata → backend's current seed → locked random.
+    seed = get_target_seed()
+    src = "target image metadata"
+    if seed is None:
+        seed = backend.current_seed() if hasattr(backend, "current_seed") else None
+        src = "InvokeAI's current seed"
+    if seed is None:
+        seed = random.randint(0, 2**31 - 1)
+        src = "a locked random seed"
+    st.session_state.fixed_seed = seed
+    st.session_state.fixed_seed_src = src
+    strategy = st.session_state.get("refine_seed_strategy", "fixed_then_random")
+    st.session_state.auto_phase = "random" if strategy == "random" else "fixed"
     st.session_state.auto_running = True
     st.session_state.auto_iter = 0
     st.session_state.auto_stop = False
@@ -631,7 +680,14 @@ def run_auto_step():
     if refine_done_flag():
         stop_auto("The model judged the prompt is as good as it will get."); st.rerun(); return
     if st.session_state.plateau_count >= plateau_n:
-        stop_auto(f"No improvement for {plateau_n} rounds — stopping."); st.rerun(); return
+        strategy = st.session_state.get("refine_seed_strategy", "fixed_then_random")
+        if strategy == "fixed_then_random" and st.session_state.auto_phase == "fixed":
+            # Escalate: prompt-only refinement stalled → explore compositions with random seeds.
+            st.session_state.auto_phase = "random"
+            st.session_state.plateau_count = 0
+            st.session_state.auto_summary = "Prompt-only refinement plateaued — now randomizing the seed to explore compositions."
+        else:
+            stop_auto(f"No improvement for {plateau_n} rounds — stopping."); st.rerun(); return
 
     backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
     prompt = current_best_prompt()
@@ -639,18 +695,22 @@ def run_auto_step():
     if not targets:
         stop_auto("Starting image was removed — stopping."); st.rerun(); return
     prev = last_result_path()
+
+    strategy = st.session_state.get("refine_seed_strategy", "fixed_then_random")
+    use_seed = None if (strategy == "random" or st.session_state.auto_phase == "random") else st.session_state.fixed_seed
+    phase_label = "random seed" if use_seed is None else f"fixed seed {use_seed}"
     try:
-        with st.status(f"Auto-refine iteration {st.session_state.auto_iter + 1}/{max_iters}…", expanded=True) as status:
+        with st.status(f"Auto-refine iteration {st.session_state.auto_iter + 1}/{max_iters} ({phase_label})…", expanded=True) as status:
             def prog(msg):
                 status.update(label=msg)
-            res = backend.generate(prompt, params={"seed": None}, progress=prog)
+            res = backend.generate(prompt, params={"seed": use_seed}, progress=prog)
             prog("Reviewing result against the target…")
             verdict = run_vision_review(targets, prev, res.image_path, prompt)
-            status.update(label=f"Iteration {st.session_state.auto_iter + 1}: {verdict['decision']}", state="complete")
+            status.update(label=f"Iteration {st.session_state.auto_iter + 1}: {verdict['decision']} (seed {res.seed})", state="complete")
     except Exception as e:
         stop_auto(f"Generation failed: {e}"); st.rerun(); return
 
-    record_refine_step(res.image_path, res.image_path.name, prompt, verdict, f"auto #{st.session_state.auto_iter + 1}")
+    record_refine_step(res.image_path, res.image_path.name, prompt, verdict, f"auto #{st.session_state.auto_iter + 1}", seed=res.seed)
     update_after_verdict(verdict, prompt)
     st.session_state.auto_iter += 1
     st.rerun()
@@ -722,6 +782,18 @@ def render_refine_section(current_provider):
         c2.number_input("Stop after N non-improving rounds", min_value=1, max_value=10, value=2,
                         key="refine_plateau_n", disabled=st.session_state.auto_running)
 
+        seed_labels = {
+            "fixed_then_random": "Fixed, then randomize on plateau (recommended)",
+            "fixed": "Fixed seed only",
+            "random": "Random seed each cycle",
+        }
+        st.selectbox("Seed strategy", options=list(seed_labels.keys()),
+                     format_func=lambda k: seed_labels[k], key="refine_seed_strategy",
+                     disabled=st.session_state.auto_running)
+        st.caption("Fixed seed holds the composition so only the prompt varies. Its value comes "
+                   "from the target image's metadata if present, else InvokeAI's current seed. "
+                   "'Fixed then randomize' explores new seeds once wording stops helping.")
+
         if not st.session_state.auto_running:
             if backend.id == "invokeai":
                 if st.button("📸 Capture current InvokeAI setup"):
@@ -740,7 +812,11 @@ def render_refine_section(current_provider):
             if st.button("⏹ Stop", type="primary"):
                 st.session_state.auto_stop = True
                 st.rerun()
+            phase = st.session_state.auto_phase
+            seed_txt = f"random seed" if phase == "random" else f"fixed seed {st.session_state.get('fixed_seed')}"
+            src = st.session_state.get("fixed_seed_src", "")
             st.caption(f"Running… iteration {st.session_state.auto_iter}/{int(st.session_state.get('refine_max_iters', 5))} "
+                       f"· {seed_txt}" + (f" (from {src})" if phase != 'random' and src else "") + " "
                        f"· plateau {st.session_state.plateau_count}/{int(st.session_state.get('refine_plateau_n', 2))} "
                        "· (Stop takes effect after the current image finishes)")
 
@@ -761,7 +837,8 @@ def render_refine_section(current_provider):
                         st.image(str(targets[0]), width=160)
                 with gc2:
                     badge = {"IMPROVE": "🟢 IMPROVE", "REVERT": "🟠 REVERT", "DONE": "✅ DONE"}.get(e["decision"], e["decision"])
-                    st.caption(f"Result v{i} · {badge}")
+                    seed_note = f" · seed {e['seed']}" if e.get("seed") is not None else ""
+                    st.caption(f"Result v{i} · {badge}{seed_note}")
                     if Path(e["result_path"]).exists():
                         st.image(e["result_path"], width=160)
                 st.caption(e["assessment"])

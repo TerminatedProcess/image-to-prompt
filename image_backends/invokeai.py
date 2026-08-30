@@ -107,6 +107,15 @@ class InvokeAIBackend(ImageGenBackend):
     def describe_setup(self):
         return self._setup_desc
 
+    def current_seed(self):
+        """Seed value baked into the captured graph (InvokeAI's last seed field)."""
+        if self._template and self._nodes.get("seed"):
+            try:
+                return int(self._template["nodes"][self._nodes["seed"]].get("value", 0))
+            except (TypeError, ValueError):
+                return None
+        return None
+
     # --- generation -------------------------------------------------------
     def generate(self, prompt, negative="", params=None, progress=None):
         params = params or {}
