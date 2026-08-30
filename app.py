@@ -1844,7 +1844,7 @@ def pv_analyze():
     with st.spinner("Analyzing image…"):
         for chunk in client.generate_chat_response(model=model, messages=api_messages, images=[ref], videos=[]):
             full += chunk
-    st.session_state.pv_prompt = remove_thinking_tags(full).strip()
+    st.session_state.pv_prompt_pending = remove_thinking_tags(full).strip()
 
 def pv_generate(source="generate"):
     prompt = st.session_state.pv_prompt.strip()
@@ -1876,7 +1876,7 @@ def pv_drop_result(path, name):
         st.error(f"Review failed: {e}"); return
     pv_add_run(before=ref, after=path, prompt=prompt or verdict["prompt"], seed=None,
                source="dropped", decision=verdict["decision"], assessment=verdict["assessment"])
-    st.session_state.pv_prompt = verdict["prompt"]
+    st.session_state.pv_prompt_pending = verdict["prompt"]
 
 def pv_clear():
     st.session_state.pv_prompt = ""
@@ -1979,7 +1979,7 @@ def pv_auto_step():
     pv_add_run(before=target, after=res.image_path, prompt=prompt, seed=res.seed,
                source=f"auto #{st.session_state.auto_iter + 1}",
                decision=verdict["decision"], assessment=verdict["assessment"])
-    st.session_state.pv_prompt = verdict["prompt"]
+    st.session_state.pv_prompt_pending = verdict["prompt"]
     update_after_verdict(verdict, prompt, image_changed=image_changed, assessment_changed=assessment_changed)
     st.session_state.auto_iter += 1
     st.rerun()
@@ -2028,6 +2028,12 @@ def render_auto_controls():
             st.info(st.session_state.auto_summary)
 
 def render_workspace():
+    # Apply any prompt update queued from a post-widget handler (analyze / auto /
+    # drop) BEFORE the text_area is instantiated — Streamlit forbids modifying a
+    # widget-keyed value after the widget exists.
+    if "pv_prompt_pending" in st.session_state:
+        st.session_state.pv_prompt = st.session_state.pop("pv_prompt_pending")
+
     st.markdown("""
     <style>
       .pv-num{font-weight:700;opacity:.7}
