@@ -492,11 +492,15 @@ def get_starting_image_paths():
     return [Path(p) for (p, _name) in st.session_state.uploaded_files]
 
 def _last_analysis_index():
-    """Index of the most recent *normal* (non-refine) assistant analysis, or None."""
+    """Index of the most recent *normal* (non-refine) assistant analysis, or None.
+
+    Skips refine verdicts and generated-image messages (which carry an image but
+    empty content) so the loop's baseline prompt is a real caption, not a blank.
+    """
     msgs = st.session_state.messages
     for i in range(len(msgs) - 1, -1, -1):
         m = msgs[i]
-        if m.get("role") == "assistant" and not m.get("refine"):
+        if m.get("role") == "assistant" and not m.get("refine") and (m.get("content") or "").strip():
             return i
     return None
 
