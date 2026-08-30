@@ -18,6 +18,7 @@ from bulk_analyzer import bulk_analysis_page
 from metadata_extractor import ImageMetadataExtractor
 import image_backends
 import lora_hub
+import ipush_bridge
 from refine_engine import REFINE_SYSTEM, build_user_message, parse_verdict
 
 # --- Constants from joycaption ---
@@ -192,6 +193,8 @@ def init_session_state():
     if "auto_phase" not in st.session_state: st.session_state.auto_phase = "fixed"
     if "fixed_seed" not in st.session_state: st.session_state.fixed_seed = None
     if "inject_lora_triggers" not in st.session_state: st.session_state.inject_lora_triggers = True
+    if "gen_build_mode" not in st.session_state: st.session_state.gen_build_mode = False
+    if "build_loras" not in st.session_state: st.session_state.build_loras = []
     if "last_result_hash" not in st.session_state: st.session_state.last_result_hash = None
     if "last_assessment" not in st.session_state: st.session_state.last_assessment = None
 
@@ -699,6 +702,22 @@ def apply_lora_triggers(prompt, backend):
         prompt = prompt.rstrip().rstrip(",") + ", " + ", ".join(additions)
     return prompt, additions
 
+def configure_backend_generation(backend):
+    """Set/clear the backend's build-from-scratch config based on the UI mode."""
+    if not hasattr(backend, "set_build_config"):
+        return
+    if st.session_state.get("gen_build_mode") and ipush_bridge.available():
+        backend.set_build_config({
+            "model_ref": ipush_bridge.current_model_ref(),
+            "loras": st.session_state.get("build_loras", []),
+            "width": int(st.session_state.get("build_width", 992)),
+            "height": int(st.session_state.get("build_height", 1488)),
+            "steps": int(st.session_state.get("build_steps", 8)),
+            "cfg": float(st.session_state.get("build_cfg", 1.0)),
+        })
+    else:
+        backend.set_build_config(None)
+
 def get_or_create_backend(backend_id):
     obj = st.session_state.refine_backend_obj
     if obj is None or getattr(obj, "id", None) != backend_id:
@@ -713,15 +732,18 @@ def stop_auto(summary):
 def start_auto_loop():
     import random
     backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
-    try:
-        backend.prepare()
-    except Exception as e:
-        st.session_state.auto_summary = f"Could not start: {e}"
-        return
+    configure_backend_generation(backend)
+    build_mode = bool(st.session_state.get("gen_build_mode"))
+    if not build_mode:
+        try:
+            backend.prepare()
+        except Exception as e:
+            st.session_state.auto_summary = f"Could not start: {e}"
+            return
     # Fixed-seed source priority: target metadata → backend's current seed → locked random.
     seed = get_target_seed()
     src = "target image metadata"
-    if seed is None:
+    if seed is None and not build_mode:
         seed = backend.current_seed() if hasattr(backend, "current_seed") else None
         src = "InvokeAI's current seed"
     if seed is None:
@@ -758,6 +780,7 @@ def run_auto_step():
             stop_auto(f"No improvement for {plateau_n} rounds — stopping."); st.rerun(); return
 
     backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
+    configure_backend_generation(backend)
     prompt = current_best_prompt()
     targets = get_starting_image_paths()
     if not targets:
@@ -817,8 +840,10 @@ def generate_prompt_in_backend(prompt):
     if not prompt or not prompt.strip():
         st.warning("This message has no prompt text to generate."); return False
     backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
+    configure_backend_generation(backend)
     try:
-        backend.prepare()
+        if not st.session_state.get("gen_build_mode"):
+            backend.prepare()
         gen_prompt, _added = apply_lora_triggers(prompt, backend)
         with st.spinner(f"Generating in {backend.display_name}…"):
             res = backend.generate(gen_prompt, params={"seed": None})
@@ -833,6 +858,61 @@ def generate_prompt_in_backend(prompt):
     })
     auto_save_chat()
     return True
+
+def render_build_controls(backend):
+    """Build-from-scratch controls (model shown, size/steps/cfg, LoRA picker)."""
+    if getattr(backend, "id", None) != "invokeai" or not ipush_bridge.available():
+        return
+    st.checkbox("🧱 Build from scratch (choose model + LoRAs via invokepush)",
+                key="gen_build_mode", disabled=st.session_state.auto_running,
+                help="Builds the InvokeAI graph from your live model + chosen LoRAs instead of "
+                     "reusing a captured setup, so you can add/remove LoRAs per run.")
+    if not st.session_state.get("gen_build_mode"):
+        return
+    mref = ipush_bridge.current_model_ref()
+    if not mref:
+        st.warning("No model selected in InvokeAI — open a model in the InvokeAI UI, then it appears here.")
+        return
+    st.caption(f"Model (live from InvokeAI): **{mref.get('name')}** ({mref.get('base')})")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.number_input("Width", 256, 2048, value=992, step=16, key="build_width", disabled=st.session_state.auto_running)
+    d2.number_input("Height", 256, 2048, value=1488, step=16, key="build_height", disabled=st.session_state.auto_running)
+    d3.number_input("Steps", 1, 60, value=8, key="build_steps", disabled=st.session_state.auto_running)
+    d4.number_input("CFG", 0.0, 20.0, value=1.0, step=0.5, key="build_cfg", disabled=st.session_state.auto_running)
+
+    if st.session_state.build_loras:
+        st.caption("**LoRAs to load:**")
+        for i, l in enumerate(list(st.session_state.build_loras)):
+            lc = st.columns([4, 2, 1])
+            lc[0].caption(l["name"])
+            l["weight"] = lc[1].number_input(
+                "weight", 0.0, 2.0, value=float(l["weight"]), step=0.05,
+                key=f"blw_{i}", label_visibility="collapsed", disabled=st.session_state.auto_running)
+            if lc[2].button("×", key=f"brm_{i}", disabled=st.session_state.auto_running):
+                st.session_state.build_loras.pop(i); st.rerun()
+
+    if not st.session_state.auto_running:
+        q = st.text_input("Search LoRAs to add", key="lora_search", placeholder="name…")
+        if q:
+            base = mref.get("base")
+            existing = {l["name"] for l in st.session_state.build_loras}
+            for r in lora_hub.search(q, limit=10):
+                name = r.get("name")
+                trigs = lora_hub._parse_triggers(r.get("triggers"))
+                rc = st.columns([5, 1])
+                rc[0].caption(f"{name} · {r.get('base_model')}"
+                              + (f" · triggers: {', '.join(trigs[:2])}" if trigs else ""))
+                if name in existing:
+                    rc[1].caption("✓")
+                elif rc[1].button("＋", key=f"badd_{r.get('id')}"):
+                    ref = ipush_bridge.match_lora_ref(name)
+                    if not ref:
+                        st.warning(f"'{name}' isn't importable in InvokeAI — import it there first.")
+                    elif ref.get("base") != base:
+                        st.warning(f"'{name}' is base {ref.get('base')}, not {base} — incompatible with this model.")
+                    else:
+                        st.session_state.build_loras.append({"name": name, "weight": 0.75, "ref": ref})
+                        st.rerun()
 
 def render_refine_section(current_provider):
     st.divider()
@@ -894,6 +974,8 @@ def render_refine_section(current_provider):
         backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
         stt = backend.status()
         st.caption(("✅ " if stt.available else "❌ ") + stt.detail)
+
+        render_build_controls(backend)
 
         c1, c2 = st.columns(2)
         c1.number_input("Max iterations", min_value=1, max_value=25, value=5,

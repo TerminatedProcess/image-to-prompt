@@ -33,6 +33,12 @@ class InvokeAIBackend(ImageGenBackend):
         self._nodes = {}
         self._base_type = None
         self._setup_desc = ""
+        self.build_config = None      # set by the app for build-from-scratch mode
+        self._last_unresolved = []
+
+    def set_build_config(self, cfg):
+        """cfg = {model_ref, loras:[{name,weight,ref}], width, height, steps, cfg} or None."""
+        self.build_config = cfg
 
     # --- reachability -----------------------------------------------------
     def status(self) -> BackendStatus:
@@ -117,7 +123,15 @@ class InvokeAIBackend(ImageGenBackend):
         return None
 
     def active_loras(self):
-        """LoRAs baked into the captured graph: [{name, hash, key, weight, node_id}]."""
+        """Active LoRAs — the chosen build set in build mode, else those baked into
+        the captured graph. Shape: [{name, hash, key, weight}]."""
+        if self.build_config:
+            out = []
+            for l in self.build_config.get("loras", []):
+                ref = l.get("ref") or {}
+                out.append({"name": l.get("name") or ref.get("name"), "hash": ref.get("hash"),
+                            "key": ref.get("key"), "weight": l.get("weight")})
+            return out
         if not self._template:
             return []
         out = []
@@ -131,11 +145,10 @@ class InvokeAIBackend(ImageGenBackend):
         return out
 
     # --- generation -------------------------------------------------------
-    def generate(self, prompt, negative="", params=None, progress=None):
-        params = params or {}
+    def _build_capture_graph(self, prompt, negative, params):
+        """Capture engine: clone the captured graph and substitute prompt/seed/size."""
         if self._template is None:
             self.capture_template()
-
         graph = copy.deepcopy(self._template)
         nodes = graph["nodes"]
 
@@ -164,7 +177,10 @@ class InvokeAIBackend(ImageGenBackend):
                     node[k] = overrides[k]
             if target == self._nodes["denoise"] and "seed" in node:
                 node["seed"] = seed
+        return graph, seed
 
+    def enqueue_and_wait(self, graph, seed, timeout=300, progress=None, output_node=None):
+        """Enqueue a ready graph, poll to completion, download the image → GenResult."""
         if progress:
             progress("Enqueuing generation…")
         payload = {"prepend": False, "batch": {"graph": graph, "runs": 1}}
@@ -173,16 +189,14 @@ class InvokeAIBackend(ImageGenBackend):
         )
         if not r.ok:
             raise RuntimeError(f"InvokeAI enqueue failed: HTTP {r.status_code} {r.text[:300]}")
-        enq = r.json()
-        item_ids = enq.get("item_ids", [])
+        item_ids = r.json().get("item_ids", [])
         if not item_ids:
             raise RuntimeError("InvokeAI accepted the batch but returned no queue item.")
         item_id = item_ids[0]
 
-        timeout_s = params.get("timeout", 300)
         t0 = time.time()
         img_name = None
-        while time.time() - t0 < timeout_s:
+        while time.time() - t0 < timeout:
             ri = requests.get(
                 f"{self.base_url}/api/v1/queue/{self.queue_id}/i/{item_id}", timeout=10
             ).json()
@@ -191,9 +205,9 @@ class InvokeAIBackend(ImageGenBackend):
                 progress("Generating…")
             if st == "completed":
                 results = ri.get("session", {}).get("results", {})
-                out = results.get(self._nodes["output"]) or next(
-                    (v for v in results.values() if isinstance(v, dict) and "image" in v), None
-                )
+                out = (results.get(output_node) if output_node else None) \
+                    or (results.get(self._nodes.get("output")) if self._nodes.get("output") else None) \
+                    or next((v for v in results.values() if isinstance(v, dict) and "image" in v), None)
                 if out and "image" in out:
                     img_name = out["image"]["image_name"]
                 break
@@ -211,6 +225,23 @@ class InvokeAIBackend(ImageGenBackend):
         TEMP_DIR.mkdir(exist_ok=True)
         out_path = TEMP_DIR / f"invoke_{uuid.uuid4().hex[:8]}_{img_name}"
         out_path.write_bytes(img.content)
-        return GenResult(
-            image_path=out_path, seed=seed, meta={"image_name": img_name, "backend": self.id}
-        )
+        return GenResult(image_path=out_path, seed=seed,
+                         meta={"image_name": img_name, "backend": self.id})
+
+    def generate(self, prompt, negative="", params=None, progress=None):
+        params = params or {}
+        if self.build_config:
+            import ipush_bridge
+            bc = self.build_config
+            if progress:
+                progress("Building graph from scratch…")
+            graph, seed, unresolved = ipush_bridge.build_graph_for(
+                model_ref=bc.get("model_ref"), prompt=prompt, negative=negative,
+                seed=params.get("seed"), width=bc.get("width", 1024), height=bc.get("height", 1024),
+                steps=bc.get("steps", 30), cfg=bc.get("cfg", 7.0),
+                loras=[(l["name"], l["weight"], l.get("ref")) for l in bc.get("loras", [])],
+            )
+            self._last_unresolved = unresolved
+        else:
+            graph, seed = self._build_capture_graph(prompt, negative, params)
+        return self.enqueue_and_wait(graph, seed, params.get("timeout", 300), progress)
