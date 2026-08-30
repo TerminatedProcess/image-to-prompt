@@ -715,6 +715,31 @@ def run_auto_step():
     st.session_state.auto_iter += 1
     st.rerun()
 
+def generate_prompt_in_backend(prompt):
+    """Generate `prompt` via the selected image backend and show the result.
+
+    A plain 'test this prompt' action — it does NOT run the compare/refine
+    review. Drop the result into Resulting Images if you want to refine it.
+    """
+    if not prompt or not prompt.strip():
+        st.warning("This message has no prompt text to generate."); return False
+    backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
+    try:
+        backend.prepare()
+        with st.spinner(f"Generating in {backend.display_name}…"):
+            res = backend.generate(prompt, params={"seed": None})
+    except Exception as e:
+        st.error(f"{backend.display_name} generation failed: {e}"); return False
+
+    st.session_state.messages.append({
+        "role": "assistant", "content": "",
+        "display_content": f"🎨 **Generated in {backend.display_name}** (seed {res.seed})",
+        "images": [{"path": str(res.image_path), "name": res.image_path.name}],
+        "id": str(uuid.uuid4()), "model": backend.id,
+    })
+    auto_save_chat()
+    return True
+
 def render_refine_section(current_provider):
     st.divider()
     st.subheader("Resulting Images — compare & refine")
@@ -842,10 +867,16 @@ def render_refine_section(current_provider):
                     if Path(e["result_path"]).exists():
                         st.image(e["result_path"], width=160)
                 st.caption(e["assessment"])
-                cols = st.columns([1, 1])
+                cols = st.columns([1, 1, 1])
                 with cols[0].popover(f"Prompt v{i}", use_container_width=True):
                     st.code(e["next_prompt"], language=None)
-                copy_button(e["next_prompt"], key=f"copy_refine_{i}")
+                with cols[1]:
+                    copy_button(e["next_prompt"], key=f"copy_refine_{i}")
+                with cols[2]:
+                    if st.button("🎨 Generate", key=f"gen_refine_{i}", use_container_width=True,
+                                 disabled=st.session_state.auto_running):
+                        if generate_prompt_in_backend(e["next_prompt"]):
+                            st.rerun()
 
 def remove_uploaded_image(idx):
     if 0 <= idx < len(st.session_state.uploaded_files):
@@ -1569,6 +1600,15 @@ with tab1:
                                 st.video(str(video_path))
                                 st.markdown('</div>', unsafe_allow_html=True)
                                 st.caption(video_info["name"])
+                # "Generate this prompt" button under any assistant prompt
+                if message.get("role") == "assistant" and (message.get("content") or "").strip():
+                    _bn = image_backends.backend_display_names().get(st.session_state.get("refine_backend", "invokeai"), "InvokeAI")
+                    gcols = st.columns([3, 1])
+                    with gcols[1]:
+                        if st.button("🎨 Generate", key=f"gen_msg_{idx}", help=f"Generate this prompt in {_bn}",
+                                     use_container_width=True, disabled=st.session_state.auto_running):
+                            if generate_prompt_in_backend(message["content"]):
+                                st.rerun()
             with col_copy:
                 if message.get('role') == 'assistant':
                     copy_button(message.get("content") or message.get("display_content", ""), key=f"copy_msg_{idx}")
