@@ -15,6 +15,8 @@ import config_manager as cm
 from api_client import APIClient
 from bulk_analyzer import bulk_analysis_page
 from metadata_extractor import ImageMetadataExtractor
+import image_backends
+from refine_engine import REFINE_SYSTEM, build_user_message, parse_verdict
 
 # --- Constants from joycaption ---
 CAPTION_TYPE_MAP = {
@@ -173,6 +175,17 @@ def init_session_state():
         # builder widgets are instantiated further down the script.
         apply_builder_config(st.session_state.builder_configs.get("__last__"))
         st.session_state.builder_restored = True
+    # --- Compare & refine (Resulting Images) state ---
+    if "result_uploader_key" not in st.session_state: st.session_state.result_uploader_key = str(uuid.uuid4())
+    if "last_result_sig" not in st.session_state: st.session_state.last_result_sig = None
+    if "refine_error" not in st.session_state: st.session_state.refine_error = None
+    if "refine_retry" not in st.session_state: st.session_state.refine_retry = None
+    if "refine_backend_obj" not in st.session_state: st.session_state.refine_backend_obj = None
+    if "auto_running" not in st.session_state: st.session_state.auto_running = False
+    if "auto_iter" not in st.session_state: st.session_state.auto_iter = 0
+    if "auto_stop" not in st.session_state: st.session_state.auto_stop = False
+    if "plateau_count" not in st.session_state: st.session_state.plateau_count = 0
+    if "auto_summary" not in st.session_state: st.session_state.auto_summary = ""
 
 init_session_state()
 
@@ -336,9 +349,21 @@ def auto_save_chat():
         st.session_state.chat_id = f"{safe_title}_{timestamp}.json"
     cm.save_conversation(st.session_state.chat_id, st.session_state.messages)
 
+def reset_refine_state():
+    st.session_state.last_result_sig = None
+    st.session_state.result_uploader_key = str(uuid.uuid4())
+    st.session_state.refine_error = None
+    st.session_state.refine_retry = None
+    st.session_state.auto_running = False
+    st.session_state.auto_iter = 0
+    st.session_state.auto_stop = False
+    st.session_state.plateau_count = 0
+    st.session_state.auto_summary = ""
+
 def start_new_chat():
     st.session_state.messages = []; st.session_state.chat_id = None; st.session_state.uploaded_files = []
     st.session_state.uploaded_videos = []; st.session_state.uploader_key = str(uuid.uuid4())
+    reset_refine_state()
 
 def load_chat_callback():
     selected_chat_file = st.session_state.get("selected_chat")
@@ -348,6 +373,7 @@ def load_chat_callback():
         st.session_state.chat_id = selected_chat_file
         st.session_state.uploaded_files = []; st.session_state.uploaded_videos = []
         st.session_state.uploader_key = str(uuid.uuid4())
+        reset_refine_state()
 
 # <<< The `regenerate_last_response` function has been REMOVED >>>
 def run_generation_logic():
@@ -440,6 +466,309 @@ def process_and_send_message(prompt_text, uploaded_file_info, uploaded_video_inf
     auto_save_chat()
     st.session_state.generating = True
     st.rerun()
+
+# ======================= Compare & Refine (Resulting Images) =======================
+def make_api_client():
+    """Build an APIClient for the current provider (mirrors run_generation_logic)."""
+    provider = st.session_state.config["api_provider"]
+    pconf = st.session_state.config["providers"].get(provider, {})
+    minicpm_config = pconf if provider == "MiniCPM" else None
+    return APIClient(
+        provider=provider,
+        base_url=pconf.get("api_base_url") if provider not in ["Google", "MiniCPM"] else None,
+        google_api_key=st.session_state.config.get("google_api_key") if provider == "Google" else None,
+        ollama_keep_alive=pconf.get("keep_alive") if provider == "Ollama" else None,
+        unload_after_response=pconf.get("unload_after_response", False) if provider in ("LM Studio", "Unsloth") else pconf.get("auto_unload", False) if provider == "MiniCPM" else False,
+        minicpm_config=minicpm_config,
+        api_key=pconf.get("api_key") if provider == "Unsloth" else None,
+    )
+
+def get_starting_image_paths():
+    return [Path(p) for (p, _name) in st.session_state.uploaded_files]
+
+def _last_analysis_index():
+    """Index of the most recent *normal* (non-refine) assistant analysis, or None."""
+    msgs = st.session_state.messages
+    for i in range(len(msgs) - 1, -1, -1):
+        m = msgs[i]
+        if m.get("role") == "assistant" and not m.get("refine"):
+            return i
+    return None
+
+def refine_entries():
+    """Refine steps for the CURRENT target only — those after the latest analysis.
+
+    Scoping to the current analysis means uploading a new starting image and
+    re-analyzing starts a fresh refine history instead of mixing in the old
+    target's prompts, results, and gallery.
+    """
+    msgs = st.session_state.messages
+    base = _last_analysis_index()
+    start = (base + 1) if base is not None else 0
+    return [m["refine_data"] for m in msgs[start:] if m.get("refine")]
+
+def refine_history():
+    return [{"prompt": e["used_prompt"], "assessment": e["assessment"]} for e in refine_entries()]
+
+def last_result_path():
+    entries = refine_entries()
+    if entries:
+        p = Path(entries[-1]["result_path"])
+        return p if p.exists() else None
+    return None
+
+def refine_done_flag():
+    entries = refine_entries()
+    return bool(entries) and entries[-1]["decision"] == "DONE"
+
+def current_best_prompt():
+    entries = refine_entries()
+    if entries:
+        return entries[-1]["next_prompt"]
+    base = _last_analysis_index()
+    if base is not None:
+        return st.session_state.messages[base].get("content", "")
+    return ""
+
+def run_vision_review(target_paths, prev_path, new_path, current_prompt):
+    """Send [targets..., prev?, new] to the vision model and parse its verdict."""
+    provider = st.session_state.config["api_provider"]
+    models = st.session_state.config["providers"].get(provider, {}).get("selected_models", [])
+    if not models:
+        raise RuntimeError("Select a vision model in the sidebar first.")
+    images = [Path(p) for p in target_paths]
+    if prev_path:
+        images.append(Path(prev_path))
+    images.append(Path(new_path))
+    user_msg = build_user_message(current_prompt, refine_history(), n_targets=len(target_paths), has_prev=bool(prev_path))
+    api_messages = [{"role": "system", "content": REFINE_SYSTEM}, {"role": "user", "content": user_msg}]
+    client = make_api_client()
+    full = ""
+    for chunk in client.generate_chat_response(model=models[0], messages=copy.deepcopy(api_messages), images=images, videos=[]):
+        full += chunk
+    return parse_verdict(remove_thinking_tags(full), fallback_prompt=current_prompt)
+
+def record_refine_step(new_path, new_name, used_prompt, verdict, source):
+    targets = get_starting_image_paths()
+    prev = last_result_path()
+    imgs = [{"path": str(p), "name": p.name} for p in targets]
+    if prev:
+        imgs.append({"path": str(prev), "name": "previous attempt"})
+    imgs.append({"path": str(new_path), "name": new_name})
+    st.session_state.messages.append({
+        "role": "user", "content": f"[Refine: {source}] Compare the newest result to the target image(s).",
+        "display_content": f"🔁 **Refine step** ({source})", "images": imgs, "id": str(uuid.uuid4()),
+    })
+    verdict_text = (
+        f"**Assessment:** {verdict['assessment']}\n\n"
+        f"**Decision:** `{verdict['decision']}`\n\n"
+        f"**Next prompt:**\n\n{verdict['prompt']}"
+    )
+    st.session_state.messages.append({
+        "role": "assistant", "content": verdict["prompt"], "display_content": verdict_text,
+        "model": "refine", "id": str(uuid.uuid4()), "refine": True,
+        "refine_data": {
+            "result_path": str(new_path), "result_name": new_name, "used_prompt": used_prompt,
+            "next_prompt": verdict["prompt"], "decision": verdict["decision"], "assessment": verdict["assessment"],
+        },
+    })
+    auto_save_chat()
+
+def _norm_prompt(s):
+    return " ".join((s or "").split()).lower()
+
+def update_after_verdict(verdict, used_prompt):
+    # A round only counts as progress when the model says IMPROVE *and* actually
+    # changed the prompt. REVERT, DONE, or IMPROVE-without-change all count as
+    # non-improving, so "stop after N non-improving rounds" behaves as labelled.
+    changed = _norm_prompt(verdict["prompt"]) != _norm_prompt(used_prompt)
+    if verdict["decision"] == "IMPROVE" and changed:
+        st.session_state.plateau_count = 0
+    else:
+        st.session_state.plateau_count += 1
+
+def do_refine_from_result(new_path, new_name, source):
+    targets = get_starting_image_paths()
+    prompt = current_best_prompt()
+    prev = last_result_path()
+    with st.spinner("Reviewing result against the target…"):
+        verdict = run_vision_review(targets, prev, new_path, prompt)
+    record_refine_step(new_path, new_name, prompt, verdict, source)
+    update_after_verdict(verdict, prompt)
+
+def get_or_create_backend(backend_id):
+    obj = st.session_state.refine_backend_obj
+    if obj is None or getattr(obj, "id", None) != backend_id:
+        obj = image_backends.get_backend(backend_id)
+        st.session_state.refine_backend_obj = obj
+    return obj
+
+def stop_auto(summary):
+    st.session_state.auto_running = False
+    st.session_state.auto_summary = summary
+
+def start_auto_loop():
+    backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
+    try:
+        backend.prepare()
+    except Exception as e:
+        st.session_state.auto_summary = f"Could not start: {e}"
+        return
+    st.session_state.auto_running = True
+    st.session_state.auto_iter = 0
+    st.session_state.auto_stop = False
+    st.session_state.plateau_count = 0
+    st.session_state.auto_summary = ""
+    st.rerun()
+
+def run_auto_step():
+    max_iters = int(st.session_state.get("refine_max_iters", 5))
+    plateau_n = int(st.session_state.get("refine_plateau_n", 2))
+    if st.session_state.auto_stop:
+        stop_auto("Stopped by user."); st.rerun(); return
+    if st.session_state.auto_iter >= max_iters:
+        stop_auto(f"Reached the max of {max_iters} iterations."); st.rerun(); return
+    if refine_done_flag():
+        stop_auto("The model judged the prompt is as good as it will get."); st.rerun(); return
+    if st.session_state.plateau_count >= plateau_n:
+        stop_auto(f"No improvement for {plateau_n} rounds — stopping."); st.rerun(); return
+
+    backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
+    prompt = current_best_prompt()
+    targets = get_starting_image_paths()
+    if not targets:
+        stop_auto("Starting image was removed — stopping."); st.rerun(); return
+    prev = last_result_path()
+    try:
+        with st.status(f"Auto-refine iteration {st.session_state.auto_iter + 1}/{max_iters}…", expanded=True) as status:
+            def prog(msg):
+                status.update(label=msg)
+            res = backend.generate(prompt, params={"seed": None}, progress=prog)
+            prog("Reviewing result against the target…")
+            verdict = run_vision_review(targets, prev, res.image_path, prompt)
+            status.update(label=f"Iteration {st.session_state.auto_iter + 1}: {verdict['decision']}", state="complete")
+    except Exception as e:
+        stop_auto(f"Generation failed: {e}"); st.rerun(); return
+
+    record_refine_step(res.image_path, res.image_path.name, prompt, verdict, f"auto #{st.session_state.auto_iter + 1}")
+    update_after_verdict(verdict, prompt)
+    st.session_state.auto_iter += 1
+    st.rerun()
+
+def render_refine_section(current_provider):
+    st.divider()
+    st.subheader("Resulting Images — compare & refine")
+
+    if current_provider == "MiniCPM":
+        st.info("Compare & refine needs a provider that accepts more than one image at a time. "
+                "MiniCPM only reads the first — switch to Unsloth, LM Studio, Koboldcpp, Ollama, or Google.")
+        return
+    if not st.session_state.uploaded_files:
+        st.caption("Add a Starting Image above, generate a prompt with **Analyze Image(s)**, "
+                   "then drop your generated result here to start refining.")
+        return
+
+    # --- Manual drop: dropping a result immediately triggers a review ---
+    st.markdown("**Drop a generated result to refine the prompt** (fires immediately):")
+    result_file = st.file_uploader(
+        "⬇ Drop generated result here",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=False,
+        key=st.session_state.result_uploader_key,
+        label_visibility="collapsed",
+        disabled=st.session_state.auto_running,
+    )
+    if result_file is not None and not st.session_state.auto_running:
+        sig = f"{result_file.name}:{result_file.size}"
+        if sig != st.session_state.last_result_sig:
+            # Record the signature FIRST so a persistent failure can't auto-retry
+            # every rerun; a Retry button below handles deliberate re-runs.
+            st.session_state.last_result_sig = sig
+            path, name = save_uploaded_file(result_file)
+            st.session_state.refine_retry = {"path": str(path), "name": name}
+            try:
+                do_refine_from_result(path, name, source="manual drop")
+                st.session_state.refine_retry = None
+                st.session_state.refine_error = None
+            except Exception as e:
+                st.session_state.refine_error = str(e)
+            st.rerun()
+
+    if st.session_state.get("refine_error"):
+        st.error(f"Refine failed: {st.session_state.refine_error}")
+        retry = st.session_state.get("refine_retry")
+        if retry and st.button("🔁 Retry review", disabled=st.session_state.auto_running):
+            try:
+                do_refine_from_result(Path(retry["path"]), retry["name"], source="manual drop (retry)")
+                st.session_state.refine_error = None
+                st.session_state.refine_retry = None
+            except Exception as e:
+                st.session_state.refine_error = str(e)
+            st.rerun()
+
+    # --- Auto-refine loop ---
+    with st.expander("🤖 Auto-refine loop (generate → review → repeat)", expanded=st.session_state.auto_running):
+        names = image_backends.backend_display_names()
+        st.selectbox("Image-generation backend", options=list(names.keys()),
+                     format_func=lambda k: names[k], key="refine_backend",
+                     disabled=st.session_state.auto_running)
+        backend = get_or_create_backend(st.session_state.get("refine_backend", "invokeai"))
+        stt = backend.status()
+        st.caption(("✅ " if stt.available else "❌ ") + stt.detail)
+
+        c1, c2 = st.columns(2)
+        c1.number_input("Max iterations", min_value=1, max_value=25, value=5,
+                        key="refine_max_iters", disabled=st.session_state.auto_running)
+        c2.number_input("Stop after N non-improving rounds", min_value=1, max_value=10, value=2,
+                        key="refine_plateau_n", disabled=st.session_state.auto_running)
+
+        if not st.session_state.auto_running:
+            if backend.id == "invokeai":
+                if st.button("📸 Capture current InvokeAI setup"):
+                    try:
+                        st.success("Captured: " + backend.capture_template())
+                    except Exception as e:
+                        st.error(str(e))
+                if backend.describe_setup():
+                    st.caption("Setup: " + backend.describe_setup())
+            has_prompt = bool(current_best_prompt())
+            if st.button("▶ Start auto-refine", disabled=not stt.available or not has_prompt, type="primary"):
+                start_auto_loop()
+            if not has_prompt:
+                st.caption("Generate an initial prompt first (Analyze the starting image), then start.")
+        else:
+            if st.button("⏹ Stop", type="primary"):
+                st.session_state.auto_stop = True
+                st.rerun()
+            st.caption(f"Running… iteration {st.session_state.auto_iter}/{int(st.session_state.get('refine_max_iters', 5))} "
+                       f"· plateau {st.session_state.plateau_count}/{int(st.session_state.get('refine_plateau_n', 2))} "
+                       "· (Stop takes effect after the current image finishes)")
+
+        if st.session_state.auto_summary:
+            st.info(st.session_state.auto_summary)
+
+    # --- Progress gallery ---
+    entries = refine_entries()
+    if entries:
+        targets = get_starting_image_paths()
+        st.markdown(f"**Refinement progress — {len(entries)} step(s):**")
+        for i, e in enumerate(entries, 1):
+            with st.container(border=True):
+                gc1, gc2 = st.columns(2)
+                with gc1:
+                    st.caption("🎯 Target")
+                    if targets:
+                        st.image(str(targets[0]), width=160)
+                with gc2:
+                    badge = {"IMPROVE": "🟢 IMPROVE", "REVERT": "🟠 REVERT", "DONE": "✅ DONE"}.get(e["decision"], e["decision"])
+                    st.caption(f"Result v{i} · {badge}")
+                    if Path(e["result_path"]).exists():
+                        st.image(e["result_path"], width=160)
+                st.caption(e["assessment"])
+                cols = st.columns([1, 1])
+                with cols[0].popover(f"Prompt v{i}", use_container_width=True):
+                    st.code(e["next_prompt"], language=None)
+                copy_button(e["next_prompt"], key=f"copy_refine_{i}")
 
 def remove_uploaded_image(idx):
     if 0 <= idx < len(st.session_state.uploaded_files):
@@ -1180,7 +1509,7 @@ with tab1:
         current_provider = st.session_state.config.get("api_provider", "Ollama")
         
         # Image upload section
-        st.subheader("Upload Images (Optional)")
+        st.subheader("Starting Images")
         uploaded_files_from_widget = st.file_uploader(
             "Upload image(s)", 
             type=["png", "jpg", "jpeg", "webp"],
@@ -1238,14 +1567,17 @@ with tab1:
                         file_path, original_name = st.session_state.uploaded_files[img_idx]
                         with cols[col_idx]:
                             st.image(str(file_path), caption=original_name, width=150)
-                            if st.button("×", key=f"remove_img_{img_idx}"):
+                            if st.button("×", key=f"remove_img_{img_idx}", disabled=st.session_state.auto_running):
                                 remove_uploaded_image(img_idx)
                             with st.popover("View Full Size", use_container_width=True):
                                 st.image(str(file_path))
                             
                             # Display metadata below the image
                             display_image_metadata(file_path, original_name)
-        
+
+        # Resulting Images: compare & refine loop
+        render_refine_section(current_provider)
+
         # Display all uploaded videos in a grid (for Google and MiniCPM)
         if st.session_state.uploaded_videos and current_provider in ["Google", "MiniCPM"]:
             st.write("**Uploaded Videos:**")
@@ -1300,10 +1632,15 @@ with tab1:
             # Chat input
             if prompt := st.chat_input("Type your message here..."):
                 process_and_send_message(
-                    prompt_text=prompt, 
+                    prompt_text=prompt,
                     uploaded_file_info=st.session_state.uploaded_files,
                     uploaded_video_info=st.session_state.uploaded_videos
                 )
+
+        # Auto-refine driver: run one generate→review step per rerun so the Stop
+        # button and the progress gallery stay responsive between iterations.
+        if st.session_state.auto_running:
+            run_auto_step()
 
 with tab2:
     bulk_analysis_page()
