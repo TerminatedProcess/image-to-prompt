@@ -2172,7 +2172,14 @@ def render_workspace():
 
     # ---- Starting images (targets) ----
     with st.container(border=True):
-        st.markdown("#### 🎯 Starting image(s)")
+        hc1, hc2 = st.columns([3, 1])
+        hc1.markdown("#### 🎯 Starting image(s)")
+        if hc2.button("🗑 Clear all", use_container_width=True, disabled=st.session_state.auto_running,
+                      help="Remove all starting image(s)."):
+            st.session_state.uploaded_files = []
+            st.session_state.pv_start_sig = None
+            st.session_state.uploader_key = str(uuid.uuid4())  # reset the uploader widget too
+            st.rerun()
         up = st.file_uploader("Upload the target image(s)", type=["png", "jpg", "jpeg", "webp"],
                               accept_multiple_files=True, key=st.session_state.uploader_key,
                               label_visibility="collapsed")
@@ -2190,6 +2197,9 @@ def render_workspace():
             for i, p in enumerate(starts):
                 with tcols[i % 10]:
                     st.image(str(p), use_container_width=True)
+                    if st.button("✕", key=f"rm_start_{i}", use_container_width=True,
+                                 disabled=st.session_state.auto_running, help="Remove this image"):
+                        remove_uploaded_image(i)  # calls st.rerun() itself
         else:
             st.caption("Drop a target image to begin.")
 
