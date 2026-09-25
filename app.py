@@ -6,6 +6,7 @@ import json
 import uuid
 import copy
 import hashlib
+import time
 from datetime import datetime
 from pathlib import Path
 import html
@@ -235,6 +236,8 @@ def init_session_state():
     if "pv_tweak_messages" not in st.session_state: st.session_state.pv_tweak_messages = []
     if "pv_tweak_open" not in st.session_state: st.session_state.pv_tweak_open = False
     if "pv_tweak_input_key" not in st.session_state: st.session_state.pv_tweak_input_key = str(uuid.uuid4())
+    # Deadline (epoch seconds) for the auto-analyze countdown after an upload; None = idle
+    if "pv_autoanalyze_at" not in st.session_state: st.session_state.pv_autoanalyze_at = None
     # Workspace settings (init here so they can be restored before their widgets render)
     if "refine_backend" not in st.session_state: st.session_state.refine_backend = "invokeai"
     if "refine_max_iters" not in st.session_state: st.session_state.refine_max_iters = 5
@@ -1873,7 +1876,38 @@ def pv_add_run(before, after, prompt, seed, source, decision=None, assessment=No
     st.session_state.pv_view = None
     return run
 
+# Seconds to wait after the last upload before analyzing on its own. Each new
+# upload restarts the countdown, so dropping several images analyzes once.
+AUTO_ANALYZE_DELAY = 10.0
+
+def arm_auto_analyze():
+    if not st.session_state.auto_running:
+        st.session_state.pv_autoanalyze_at = time.time() + AUTO_ANALYZE_DELAY
+
+def cancel_auto_analyze():
+    st.session_state.pv_autoanalyze_at = None
+
+@st.fragment(run_every=1.0)
+def auto_analyze_countdown():
+    """Ticks once a second while a countdown is armed, then fires the analysis
+    on the main script (a fragment can't update the prompt widget itself)."""
+    due = st.session_state.get("pv_autoanalyze_at")
+    if not due:
+        return
+    left = due - time.time()
+    if left <= 0:
+        st.session_state.pv_autoanalyze_at = None
+        st.session_state.pv_autoanalyze_now = True
+        st.rerun(scope="app")
+        return
+    c1, c2 = st.columns([3, 1])
+    c1.caption(f"🔍 Auto-analyzing in {int(left) + 1}s — drop more images to restart the countdown.")
+    if c2.button("Cancel", key="pv_cancel_autoanalyze", use_container_width=True):
+        st.session_state.pv_autoanalyze_at = None
+        st.rerun(scope="app")
+
 def pv_analyze():
+    cancel_auto_analyze()
     ref = pv_before_path()
     if not ref:
         st.warning("Add a starting image first."); return
@@ -1922,6 +1956,7 @@ def pv_drop_result(path, name):
     st.session_state.pv_prompt_pending = verdict["prompt"]
 
 def pv_clear():
+    cancel_auto_analyze()
     st.session_state.pv_prompt = ""
     st.session_state.pv_runs = []
     st.session_state.pv_view = None
@@ -2125,6 +2160,9 @@ def ai_tweak_dialog():
         st.rerun()
 
 def render_workspace():
+    # Countdown elapsed → analyze now, before the prompt widget is instantiated.
+    if st.session_state.pop("pv_autoanalyze_now", False):
+        pv_analyze()
     # Apply any prompt update queued from a post-widget handler (analyze / auto /
     # drop / tweak) BEFORE the text_area is instantiated — Streamlit forbids
     # modifying a widget-keyed value after the widget exists.
@@ -2178,6 +2216,7 @@ def render_workspace():
                       help="Remove all starting image(s)."):
             st.session_state.uploaded_files = []
             st.session_state.pv_start_sig = None
+            cancel_auto_analyze()
             st.session_state.uploader_key = str(uuid.uuid4())  # reset the uploader widget too
             st.rerun()
         up = st.file_uploader("Upload the target image(s)", type=["png", "jpg", "jpeg", "webp"],
@@ -2189,6 +2228,7 @@ def render_workspace():
                 st.session_state.pv_start_sig = sig
                 st.session_state.uploaded_files = [save_uploaded_file(f) for f in up]
                 st.session_state.pv_before = None  # new target becomes the reference
+                arm_auto_analyze()
         starts = get_starting_image_paths()
         if starts:
             # Narrow columns keep them thumbnail-sized on screen, but use_container_width
@@ -2202,6 +2242,8 @@ def render_workspace():
                         remove_uploaded_image(i)  # calls st.rerun() itself
         else:
             st.caption("Drop a target image to begin.")
+        if st.session_state.get("pv_autoanalyze_at"):
+            auto_analyze_countdown()
 
     # ================= TOP PANEL: current / snapshot =================
     with st.container(border=True):
